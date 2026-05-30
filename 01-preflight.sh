@@ -22,6 +22,20 @@
 set -uo pipefail
 
 # =============================================================================
+# ENVIRONMENT — detect node type, export KUBECONFIG and PATH
+# Detection: /etc/rancher/rke2/rke2.yaml is only created by RKE2 on server
+# nodes. Agent nodes only have the kubelet kubeconfig under the agent dir.
+# PATH is extended the same way on both roles so that rke2, etcdctl, and
+# kubectl (symlinked by RKE2) are all reachable without full paths.
+# =============================================================================
+if [[ -f /etc/rancher/rke2/rke2.yaml ]]; then
+  export KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
+else
+  export KUBECONFIG="/var/lib/rancher/rke2/agent/kubelet.kubeconfig"
+fi
+export PATH="$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin"
+
+# =============================================================================
 # CONFIGURATION — adjust to match the environment
 # =============================================================================
 # Node counts are NOT hardcoded. discover_topology() derives them at runtime

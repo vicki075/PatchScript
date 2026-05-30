@@ -42,6 +42,24 @@
 set -uo pipefail
 
 # =============================================================================
+# ENVIRONMENT — detect node type, export KUBECONFIG and PATH
+#
+# --global and --stop-server run on server nodes → rke2.yaml
+# --stop-agent runs on agent nodes               → kubelet.kubeconfig
+#   (agent KUBECONFIG is read-only and scoped to the local node;
+#    no cluster-wide kubectl calls are made in --stop-agent mode)
+#
+# PATH is extended the same way on both roles so that rke2-killall.sh,
+# etcdctl, and kubectl are reachable without hardcoded full paths.
+# =============================================================================
+if [[ -f /etc/rancher/rke2/rke2.yaml ]]; then
+  export KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
+else
+  export KUBECONFIG="/var/lib/rancher/rke2/agent/kubelet.kubeconfig"
+fi
+export PATH="$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin"
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 readonly UIPATH_NS="uipath"
