@@ -33,6 +33,20 @@
 set -uo pipefail
 
 # =============================================================================
+# ENVIRONMENT — detect node type, export KUBECONFIG and PATH
+# This script only runs on server nodes (guard_server_node() enforces this),
+# so KUBECONFIG will always resolve to rke2.yaml. The agent branch is kept
+# for consistency and to avoid an unbound-variable error on PATH/KUBECONFIG
+# if the guard fires before any other command.
+# =============================================================================
+if [[ -f /etc/rancher/rke2/rke2.yaml ]]; then
+  export KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
+else
+  export KUBECONFIG="/var/lib/rancher/rke2/agent/kubelet.kubeconfig"
+fi
+export PATH="$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin"
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 readonly SNAP_DIR="/var/lib/rancher/rke2/server/db/snapshots"
