@@ -1,0 +1,455 @@
+#!/bin/bash
+
+# Proxy Configuration Validation Script
+# This script compares proxy configurations across all layers:
+# - Kubernetes ConfigMaps
+# - Istio ServiceEntry
+# - Pod environment variables
+# - Node-level configuration files
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Configuration
+NAMESPACE="${NAMESPACE:-uipath}"
+ISTIO_NAMESPACE="${ISTIO_NAMESPACE:-istio-system}"
+SAMPLE_POD_LABEL="${SAMPLE_POD_LABEL:-app=orchestrator}"
+
+echo -e "${BLUE}========================================${NC}"
+echo -e "${BLUE}Proxy Configuration Validation${NC}"
+echo -e "${BLUE}========================================${NC}"
+echo ""
+echo "Namespace: ${NAMESPACE}"
+echo "Istio Namespace: ${ISTIO_NAMESPACE}"
+echo ""
+
+# Function to print section headers
+print_section() {
+    echo ""
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================${NC}"
+}
+
+# Function to print findings
+print_finding() {
+    local level=$1
+    local message=$2
+    case $level in
+        "OK")
+            echo -e "${GREEN}✓ ${message}${NC}"
+            ;;
+        "WARNING")
+            echo -e "${YELLOW}⚠ ${message}${NC}"
+            ;;
+        "ERROR")
+            echo -e "${RED}✗ ${message}${NC}"
+            ;;
+        *)
+            echo "  ${message}"
+            ;;
+    esac
+}
+
+# Arrays to store values for comparison
+declare -A PROXY_VALUES
+
+#########################################
+# 1. Check Kubernetes ConfigMaps
+#########################################
+print_section "1. Kubernetes ConfigMaps"
+
+# Check proxy-config-cm
+echo "Checking ConfigMap: proxy-config-cm"
+if kubectl get configmap proxy-config-cm -n "$NAMESPACE" >/dev/null 2>&1; then
+    print_finding "OK" "ConfigMap 'proxy-config-cm' exists"
+
+    # Extract proxy configuration
+    CONFIG_DATA=$(kubectl get configmap proxy-config-cm -n "$NAMESPACE" -o jsonpath='{.data.proxy-webhook-config\.yaml}' 2>/dev/null || echo "")
+
+    if [ -n "$CONFIG_DATA" ]; then
+        echo ""
+        echo "Configuration content:"
+        echo "$CONFIG_DATA"
+        echo ""
+
+        # Extract NO_PROXY value
+        NO_PROXY_CM1=$(echo "$CONFIG_DATA" | grep -A1 "name: NO_PROXY" | grep "value:" | sed 's/.*value: //' | tr -d '\n' || echo "NOT_FOUND")
+        PROXY_VALUES["configmap_proxy-config-cm"]="$NO_PROXY_CM1"
+
+        echo "NO_PROXY value: $NO_PROXY_CM1"
+
+        # Check if FQDN-like values are present
+        if echo "$NO_PROXY_CM1" | grep -qE '\.(com|io|net|local|cluster)'; then
+            print_finding "OK" "NO_PROXY appears to contain domain names"
+        else
+            print_finding "WARNING" "NO_PROXY may not contain cluster FQDN"
+        fi
+    else
+        print_finding "WARNING" "Could not extract proxy-webhook-config.yaml data"
+    fi
+else
+    print_finding "ERROR" "ConfigMap 'proxy-config-cm' not found"
+fi
+
+echo ""
+echo "---"
+
+# Check proxy-webhook-configmap
+echo "Checking ConfigMap: proxy-webhook-configmap"
+if kubectl get configmap proxy-webhook-configmap -n "$NAMESPACE" >/dev/null 2>&1; then
+    print_finding "OK" "ConfigMap 'proxy-webhook-configmap' exists"
+
+    CONFIG_DATA=$(kubectl get configmap proxy-webhook-configmap -n "$NAMESPACE" -o jsonpath='{.data.proxy-webhook-config\.yaml}' 2>/dev/null || echo "")
+
+    if [ -n "$CONFIG_DATA" ]; then
+        echo ""
+        echo "Configuration content:"
+        echo "$CONFIG_DATA"
+        echo ""
+
+        NO_PROXY_CM2=$(echo "$CONFIG_DATA" | grep -A1 "name: NO_PROXY" | grep "value:" | sed 's/.*value: //' | tr -d '\n' || echo "NOT_FOUND")
+        PROXY_VALUES["configmap_proxy-webhook-configmap"]="$NO_PROXY_CM2"
+
+        echo "NO_PROXY value: $NO_PROXY_CM2"
+
+        if echo "$NO_PROXY_CM2" | grep -qE '\.(com|io|net|local|cluster)'; then
+            print_finding "OK" "NO_PROXY appears to contain domain names"
+        else
+            print_finding "WARNING" "NO_PROXY may not contain cluster FQDN"
+        fi
+    else
+        print_finding "WARNING" "Could not extract proxy-webhook-config.yaml data"
+    fi
+else
+    print_finding "WARNING" "ConfigMap 'proxy-webhook-configmap' not found (may not be deployed)"
+fi
+
+#########################################
+# 2. Check MutatingWebhookConfiguration
+#########################################
+print_section "2. MutatingWebhookConfiguration"
+
+echo "Checking: proxy-webhook-webhook-configuration"
+if kubectl get mutatingwebhookconfiguration proxy-webhook-webhook-configuration >/dev/null 2>&1; then
+    print_finding "OK" "MutatingWebhookConfiguration exists"
+
+    echo ""
+    echo "Webhook selectors:"
+    kubectl get mutatingwebhookconfiguration proxy-webhook-webhook-configuration -o jsonpath='{.webhooks[*].namespaceSelector}' | jq '.' 2>/dev/null || echo "Could not parse namespace selector"
+    kubectl get mutatingwebhookconfiguration proxy-webhook-webhook-configuration -o jsonpath='{.webhooks[*].objectSelector}' | jq '.' 2>/dev/null || echo "Could not parse object selector"
+
+    echo ""
+    echo "Webhook service:"
+    kubectl get mutatingwebhookconfiguration proxy-webhook-webhook-configuration -o jsonpath='{.webhooks[*].clientConfig.service}' | jq '.' 2>/dev/null || echo "Could not parse service config"
+else
+    print_finding "WARNING" "MutatingWebhookConfiguration not found"
+fi
+
+#########################################
+# 3. Check Istio ServiceEntry
+#########################################
+print_section "3. Istio ServiceEntry Resources"
+
+# Check FQDN ServiceEntry
+echo "Checking ServiceEntry: uipath-fqdn"
+if kubectl get serviceentry uipath-fqdn -n "$ISTIO_NAMESPACE" >/dev/null 2>&1; then
+    print_finding "OK" "ServiceEntry 'uipath-fqdn' exists"
+
+    echo ""
+    echo "Configured hosts:"
+    FQDN_HOSTS=$(kubectl get serviceentry uipath-fqdn -n "$ISTIO_NAMESPACE" -o jsonpath='{.spec.hosts[*]}')
+    echo "$FQDN_HOSTS"
+    PROXY_VALUES["istio_fqdn_hosts"]="$FQDN_HOSTS"
+
+    echo ""
+    echo "Full ServiceEntry spec:"
+    kubectl get serviceentry uipath-fqdn -n "$ISTIO_NAMESPACE" -o yaml | grep -A20 "^spec:"
+else
+    print_finding "WARNING" "ServiceEntry 'uipath-fqdn' not found"
+fi
+
+echo ""
+echo "---"
+
+# Check Proxy ServiceEntry
+echo "Checking ServiceEntry: uipath-proxy"
+if kubectl get serviceentry uipath-proxy -n "$ISTIO_NAMESPACE" >/dev/null 2>&1; then
+    print_finding "OK" "ServiceEntry 'uipath-proxy' exists (proxy routing enabled)"
+
+    echo ""
+    echo "Proxy configuration:"
+    PROXY_HOST=$(kubectl get serviceentry uipath-proxy -n "$ISTIO_NAMESPACE" -o jsonpath='{.spec.hosts[0]}')
+    PROXY_ADDR=$(kubectl get serviceentry uipath-proxy -n "$ISTIO_NAMESPACE" -o jsonpath='{.spec.addresses[0]}')
+    PROXY_PORT=$(kubectl get serviceentry uipath-proxy -n "$ISTIO_NAMESPACE" -o jsonpath='{.spec.ports[0].number}')
+
+    echo "  Host: $PROXY_HOST"
+    echo "  Address: ${PROXY_ADDR:-<using DNS>}"
+    echo "  Port: $PROXY_PORT"
+
+    PROXY_VALUES["istio_proxy_host"]="$PROXY_HOST"
+    PROXY_VALUES["istio_proxy_addr"]="$PROXY_ADDR"
+    PROXY_VALUES["istio_proxy_port"]="$PROXY_PORT"
+
+    echo ""
+    echo "Full ServiceEntry spec:"
+    kubectl get serviceentry uipath-proxy -n "$ISTIO_NAMESPACE" -o yaml | grep -A20 "^spec:"
+else
+    print_finding "OK" "ServiceEntry 'uipath-proxy' not found (proxy routing disabled)"
+fi
+
+#########################################
+# 4. Check Pod Environment Variables
+#########################################
+print_section "4. Pod Environment Variables"
+
+echo "Looking for sample pod with label: $SAMPLE_POD_LABEL"
+SAMPLE_POD=$(kubectl get pods -n "$NAMESPACE" -l "$SAMPLE_POD_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+if [ -n "$SAMPLE_POD" ]; then
+    print_finding "OK" "Found sample pod: $SAMPLE_POD"
+
+    echo ""
+    echo "Proxy environment variables in pod:"
+    POD_PROXY_VARS=$(kubectl exec -n "$NAMESPACE" "$SAMPLE_POD" -- env 2>/dev/null | grep -i proxy || echo "")
+
+    if [ -n "$POD_PROXY_VARS" ]; then
+        echo "$POD_PROXY_VARS"
+
+        # Extract NO_PROXY value
+        NO_PROXY_POD=$(echo "$POD_PROXY_VARS" | grep "^NO_PROXY=" | cut -d'=' -f2-)
+        PROXY_VALUES["pod_no_proxy"]="$NO_PROXY_POD"
+
+        echo ""
+        echo "NO_PROXY value: $NO_PROXY_POD"
+
+        # Check for FQDN in NO_PROXY
+        if echo "$NO_PROXY_POD" | grep -qE '\.(com|io|net|org|local|cluster)'; then
+            print_finding "OK" "Pod NO_PROXY contains domain names"
+        else
+            print_finding "ERROR" "Pod NO_PROXY does NOT contain cluster FQDN!"
+        fi
+
+        # Check for HTTP_PROXY
+        HTTP_PROXY_POD=$(echo "$POD_PROXY_VARS" | grep "^HTTP_PROXY=" | cut -d'=' -f2-)
+        if [ -n "$HTTP_PROXY_POD" ]; then
+            echo "HTTP_PROXY: $HTTP_PROXY_POD"
+            PROXY_VALUES["pod_http_proxy"]="$HTTP_PROXY_POD"
+        else
+            print_finding "OK" "HTTP_PROXY not set (proxy disabled or not configured)"
+        fi
+
+        # Check for HTTPS_PROXY
+        HTTPS_PROXY_POD=$(echo "$POD_PROXY_VARS" | grep "^HTTPS_PROXY=" | cut -d'=' -f2-)
+        if [ -n "$HTTPS_PROXY_POD" ]; then
+            echo "HTTPS_PROXY: $HTTPS_PROXY_POD"
+            PROXY_VALUES["pod_https_proxy"]="$HTTPS_PROXY_POD"
+        else
+            print_finding "OK" "HTTPS_PROXY not set (proxy disabled or not configured)"
+        fi
+    else
+        print_finding "WARNING" "No proxy environment variables found in pod"
+    fi
+else
+    print_finding "ERROR" "Could not find sample pod with label: $SAMPLE_POD_LABEL"
+    echo "Available pods in namespace $NAMESPACE:"
+    kubectl get pods -n "$NAMESPACE" --no-headers | awk '{print "  - " $1}'
+    echo ""
+    echo "Try setting SAMPLE_POD_LABEL environment variable, e.g.:"
+    echo "  SAMPLE_POD_LABEL=app=identity ./validate-proxy-config.sh"
+fi
+
+#########################################
+# 5. Check Proxy Webhook Deployment
+#########################################
+print_section "5. Proxy Webhook Deployment"
+
+echo "Checking deployment: proxy-webhook"
+if kubectl get deployment proxy-webhook -n "$NAMESPACE" >/dev/null 2>&1; then
+    print_finding "OK" "Deployment 'proxy-webhook' exists"
+
+    echo ""
+    echo "Replica status:"
+    kubectl get deployment proxy-webhook -n "$NAMESPACE" -o jsonpath='{.status.replicas} desired, {.status.readyReplicas} ready, {.status.availableReplicas} available'
+    echo ""
+
+    echo ""
+    echo "Proxy-related environment variables in webhook deployment:"
+    kubectl get deployment proxy-webhook -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[*].env[?(@.name =~ /.*PROXY.*/)]}' | jq '.' 2>/dev/null || echo "No proxy env vars or jq not available"
+
+    echo ""
+    echo "ConfigMap volumes mounted:"
+    kubectl get deployment proxy-webhook -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[?(@.configMap)]}' | jq '.' 2>/dev/null || echo "Could not parse volumes"
+else
+    print_finding "WARNING" "Deployment 'proxy-webhook' not found"
+fi
+
+#########################################
+# 6. Check Node Configuration (if nodes are accessible)
+#########################################
+print_section "6. Node-Level Configuration"
+
+echo "Checking if nodes are accessible..."
+NODE_LIST=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}')
+
+if [ -n "$NODE_LIST" ]; then
+    print_finding "OK" "Found nodes: $NODE_LIST"
+    echo ""
+    echo "NOTE: To check node-level proxy configuration, you need SSH access to nodes."
+    echo ""
+    echo "Run these commands on EACH node:"
+    echo ""
+    for NODE in $NODE_LIST; do
+        echo "# Node: $NODE"
+        echo "ssh $NODE 'cat /etc/environment | grep -i proxy'"
+        echo "ssh $NODE 'cat /etc/wgetrc | grep -i proxy'"
+        echo ""
+    done
+
+    echo "If you have SSH access and kubectl-node-shell or similar, you can run:"
+    echo ""
+    FIRST_NODE=$(echo "$NODE_LIST" | awk '{print $1}')
+    echo "kubectl node-shell $FIRST_NODE -- cat /etc/environment | grep -i proxy"
+    echo "kubectl node-shell $FIRST_NODE -- cat /etc/wgetrc | grep -i proxy"
+else
+    print_finding "ERROR" "Could not list nodes"
+fi
+
+#########################################
+# 7. Comparison and Analysis
+#########################################
+print_section "7. Comparison and Analysis"
+
+echo "Collected NO_PROXY values from different sources:"
+echo ""
+
+for key in "${!PROXY_VALUES[@]}"; do
+    if [[ "$key" == *"no_proxy"* ]] || [[ "$key" == *"NO_PROXY"* ]]; then
+        echo "[$key]"
+        echo "  ${PROXY_VALUES[$key]}"
+        echo ""
+    fi
+done
+
+echo "---"
+echo ""
+
+# Check if NO_PROXY values are consistent
+echo "Consistency Check:"
+echo ""
+
+# Get unique NO_PROXY values
+declare -A UNIQUE_NO_PROXY
+for key in "${!PROXY_VALUES[@]}"; do
+    if [[ "$key" == *"no_proxy"* ]] || [[ "$key" == *"NO_PROXY"* ]] || [[ "$key" == "configmap_proxy-config-cm" ]] || [[ "$key" == "configmap_proxy-webhook-configmap" ]]; then
+        value="${PROXY_VALUES[$key]}"
+        if [ -n "$value" ] && [ "$value" != "NOT_FOUND" ]; then
+            UNIQUE_NO_PROXY["$value"]=1
+        fi
+    fi
+done
+
+NUM_UNIQUE=${#UNIQUE_NO_PROXY[@]}
+
+if [ "$NUM_UNIQUE" -eq 0 ]; then
+    print_finding "WARNING" "No NO_PROXY values found to compare"
+elif [ "$NUM_UNIQUE" -eq 1 ]; then
+    print_finding "OK" "All NO_PROXY values are consistent"
+else
+    print_finding "ERROR" "INCONSISTENT NO_PROXY values found across different layers!"
+    echo ""
+    echo "This is likely the root cause of your FQDN connection issues."
+    echo ""
+    echo "Different NO_PROXY values detected:"
+    for value in "${!UNIQUE_NO_PROXY[@]}"; do
+        echo "  - $value"
+    done
+fi
+
+echo ""
+echo "---"
+echo ""
+
+# Check for common issues
+echo "Common Issues Check:"
+echo ""
+
+# Check if default NO_PROXY is being used (missing FQDN)
+DEFAULT_NO_PROXY="127.0.0.0/8,127.0.0.0,localhost,kubernetes,.svc,.local,.cluster"
+for key in "${!PROXY_VALUES[@]}"; do
+    if [[ "$key" == *"no_proxy"* ]] || [[ "$key" == *"NO_PROXY"* ]] || [[ "$key" == "configmap_proxy-config-cm" ]] || [[ "$key" == "configmap_proxy-webhook-configmap" ]]; then
+        value="${PROXY_VALUES[$key]}"
+        if [ "$value" == "$DEFAULT_NO_PROXY" ]; then
+            print_finding "ERROR" "[$key] is using DEFAULT NO_PROXY without cluster FQDN!"
+            echo "  This will cause FQDN connections to fail!"
+            echo ""
+        fi
+    fi
+done
+
+# Check if NO_PROXY contains Azure metadata endpoints (good practice)
+echo "Checking for Azure/cloud metadata endpoints in NO_PROXY:"
+for key in "${!PROXY_VALUES[@]}"; do
+    if [[ "$key" == "pod_no_proxy" ]]; then
+        value="${PROXY_VALUES[$key]}"
+        if echo "$value" | grep -q "169.254.169.254"; then
+            print_finding "OK" "Azure metadata endpoint (169.254.169.254) found in pod NO_PROXY"
+        else
+            print_finding "WARNING" "Azure metadata endpoint (169.254.169.254) NOT found in pod NO_PROXY"
+        fi
+
+        if echo "$value" | grep -q "10.0.0.0/8"; then
+            print_finding "OK" "Kubernetes service subnet (10.0.0.0/8) found in pod NO_PROXY"
+        else
+            print_finding "WARNING" "Kubernetes service subnet (10.0.0.0/8) NOT found in pod NO_PROXY"
+        fi
+    fi
+done
+
+#########################################
+# 8. Summary and Recommendations
+#########################################
+print_section "8. Summary and Recommendations"
+
+echo "Issue: FQDN connections fail, but NodePort connections work"
+echo ""
+echo "Root Cause Analysis:"
+echo "  - NodePort uses internal IP (10.0.0.0/8) which bypasses proxy"
+echo "  - FQDN uses DNS name which gets routed through proxy"
+echo "  - If cluster FQDN is NOT in NO_PROXY, FQDN traffic fails"
+echo ""
+
+if [ "$NUM_UNIQUE" -gt 1 ]; then
+    echo "DIAGNOSIS: INCONSISTENT proxy configuration detected"
+    echo ""
+    echo "Recommended Actions:"
+    echo "  1. Identify the correct cluster FQDN from Istio ServiceEntry"
+    echo "  2. Update proxy-webhook ConfigMap defaults to include FQDN"
+    echo "  3. Update common proxy-injector template with FQDN"
+    echo "  4. Redeploy proxy-webhook to pick up new configuration"
+    echo "  5. Restart affected pods to get corrected NO_PROXY"
+    echo ""
+    echo "Files to update:"
+    echo "  - Services_Installer/helm/service-fabric-core/charts/proxy-webhook/values.yaml"
+    echo "  - Services_Installer/helm/common/templates/_proxy-injector.tpl"
+else
+    echo "Proxy configuration appears consistent, but verify:"
+    echo "  1. Cluster FQDN is included in NO_PROXY"
+    echo "  2. Alternative FQDN (if any) is included in NO_PROXY"
+    echo "  3. Node-level configuration matches pod-level"
+fi
+
+echo ""
+print_section "Validation Complete"
+echo ""
+echo "For detailed investigation, review the output above and compare:"
+echo "  - ConfigMap NO_PROXY vs Pod NO_PROXY"
+echo "  - Istio ServiceEntry hosts vs NO_PROXY domains"
+echo "  - Node /etc/environment vs Pod environment variables"
+echo ""
