@@ -149,8 +149,11 @@ guard_server_node() {
 
 # =============================================================================
 # STEP 1: Identify the last SNAP_MIN_COUNT snapshots by filename epoch
-# Returns newline-separated list of filenames (not full paths), newest last.
+# Result written to global SNAPSHOT_LIST (newline-separated filenames, newest last).
+# NOT captured via $() — avoids stdout collision with info() in verbose mode.
 # =============================================================================
+SNAPSHOT_LIST=""
+
 identify_snapshots() {
   info "Identifying last ${SNAP_MIN_COUNT} snapshots in ${SNAP_DIR} on $(hostname)..."
 
@@ -167,8 +170,7 @@ identify_snapshots() {
 
   # Sort by unix epoch embedded in filename (authoritative — not file mtime)
   # Filename format: etcd-snapshot-<hostname>-<unix-epoch>[.zip]
-  local sorted_snaps
-  sorted_snaps=$(ls -1 "${SNAP_DIR}/" \
+  SNAPSHOT_LIST=$(ls -1 "${SNAP_DIR}/" \
     | grep "^etcd-snapshot-" \
     | while read -r f; do
         ep=$(echo "${f}" | grep -oE '[0-9]{9,11}' | tail -1)
@@ -178,16 +180,14 @@ identify_snapshots() {
     | tail -"${SNAP_MIN_COUNT}" \
     | awk '{print $2}')
 
-  if [[ -z "${sorted_snaps}" ]]; then
+  if [[ -z "${SNAPSHOT_LIST}" ]]; then
     fail "Could not identify any snapshots with parseable epoch timestamps in ${SNAP_DIR}"
   fi
 
   info "Selected snapshots (newest last):"
   if [[ "${VERBOSE}" == "true" ]]; then
-    echo "${sorted_snaps}" | sed 's/^/  /'
+    echo "${SNAPSHOT_LIST}" | sed 's/^/  /'
   fi
-
-  echo "${sorted_snaps}"
 }
 
 # =============================================================================
@@ -337,19 +337,22 @@ verify_cluster_after_backup() {
     fi
 
     # Maintenance mode still set
-    local mm="unknown"
+    # is-enabled returns "true"/"false" or a descriptive string — use grep-based check
     if [[ -n "${UIPATHCTL_BIN}" ]] || resolve_uipathctl; then
-      mm=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled --namespace uipath 2>/dev/null \
-        | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || echo "unknown")
+      local mm_raw mm_on=false
+      mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled --namespace uipath 2>/dev/null || true)
+      if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
+        echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
+      fi
+      if [[ "${mm_on}" == "true" ]]; then
+        info "POST-BACKUP: Maintenance mode still enabled  ✓"
+      else
+        log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Maintenance mode does not appear enabled (is-enabled: '${mm_raw}') — verify manually"
+      fi
     else
       log "${YELLOW}[WARN]${RESET}  POST-BACKUP: uipathctl not found — skipping maintenance mode check"
       log "${YELLOW}[WARN]${RESET}          Try: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
       log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
-    fi
-    if [[ "${mm}" == "true" ]]; then
-      info "POST-BACKUP: Maintenance mode still enabled  ✓"
-    elif [[ "${mm}" != "unknown" ]]; then
-      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Maintenance mode is-enabled returned '${mm}' — expected 'true'"
     fi
   else
     log "${YELLOW}[WARN]${RESET}  POST-BACKUP: kubectl not available — skipping cluster health verification"
@@ -402,8 +405,7 @@ main() {
   # Step 1 + 2 + 3: Identify, validate, and copy snapshots
   echo ""
   info "--- Phase B.1: etcd Snapshot Safety Net ---"
-  local snapshot_list
-  snapshot_list=$(identify_snapshots)
+  identify_snapshots   # populates global SNAPSHOT_LIST
 
   while IFS= read -r snap_name; do
     [[ -z "${snap_name}" ]] && continue
@@ -412,7 +414,7 @@ main() {
     copy_snapshot "${snap_path}" "${ETCD_DEST}"
     pass "Snapshot copied and verified: ${snap_name}"
     echo ""
-  done <<< "${snapshot_list}"
+  done <<< "${SNAPSHOT_LIST}"
 
   # Step 4: RKE2 config backup
   echo ""
