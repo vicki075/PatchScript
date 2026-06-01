@@ -242,20 +242,49 @@ mode_identify_leader() {
     echo ""
   fi
 
-  log "${CYAN}[INFO]${RESET}  Leader summary:"
+  # Build IP→hostname map from kubectl node objects so we can annotate each endpoint
+  local node_ip_map
+  node_ip_map=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+import json, sys
+items = json.load(sys.stdin).get('items', [])
+for n in items:
+    name = n['metadata']['name']
+    for addr in n.get('status', {}).get('addresses', []):
+        if addr.get('type') == 'InternalIP':
+            print(addr['address'], name)
+            break
+" 2>/dev/null || true)
+
+  log "${CYAN}[INFO]${RESET}  Leader summary (IP → hostname):"
   etcdctl_cmd endpoint status --cluster -w json 2>/dev/null \
     | python3 -c "
 import json, sys
+
+# Read node map from stdin arg (passed via env)
+import os
+node_map = {}
+for line in os.environ.get('NODE_IP_MAP','').splitlines():
+    parts = line.split(None, 1)
+    if len(parts) == 2:
+        node_map[parts[0]] = parts[1]
+
 data = json.load(sys.stdin)
 for e in data:
-    ep = e.get('Endpoint','?')
-    st = e.get('Status', {})
+    ep  = e.get('Endpoint','?')
+    st  = e.get('Status', {})
     member_id = st.get('header', {}).get('member_id', -1)
-    leader_id  = st.get('leader', -2)
-    is_leader  = (member_id == leader_id)
+    leader_id = st.get('leader', -2)
+    is_leader = (member_id == leader_id)
+    # extract IP from endpoint url (https://IP:port)
+    try:
+        ip = ep.split('//')[1].split(':')[0]
+    except Exception:
+        ip = ep
+    hostname = node_map.get(ip, ip)
     label = '  <<< LEADER — stop this server LAST' if is_leader else ''
-    print(f'  {ep}{label}')
-" 2>/dev/null || log "${YELLOW}[WARN]${RESET}  Could not parse leader from JSON output — re-run with --verbose for table"
+    print(f'  {hostname}  ({ep}){label}')
+" NODE_IP_MAP="${node_ip_map}" 2>/dev/null \
+  || log "${YELLOW}[WARN]${RESET}  Could not parse leader from JSON output — re-run with --verbose for table"
 
   echo ""
 }
@@ -363,13 +392,17 @@ mode_global() {
 
     # Label FIRST — prevents nodejanitor from uncordoning a node that is
     # cordoned but not yet labelled if the script is interrupted mid-loop.
-    if kubectl label --overwrite node "${node}" nodejanitor/skip=true 2>/dev/null; then
+    # Redirect stdout to /dev/null in quiet mode (kubectl prints "node/x labeled")
+    local kout="/dev/null"
+    [[ "${VERBOSE}" == "true" ]] && kout="/dev/stdout"
+
+    if kubectl label --overwrite node "${node}" nodejanitor/skip=true >"${kout}" 2>/dev/null; then
       info "  Labelled:  ${node}  (nodejanitor/skip=true)"
     else
       fail "Phase C: kubectl label nodejanitor/skip=true failed for node ${node}"
     fi
 
-    if kubectl cordon "${node}" 2>/dev/null; then
+    if kubectl cordon "${node}" >"${kout}" 2>/dev/null; then
       info "  Cordoned:  ${node}"
     else
       fail "Phase C: kubectl cordon failed for node ${node}"
