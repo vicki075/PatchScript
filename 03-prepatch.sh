@@ -668,35 +668,58 @@ mode_stop_server() {
     # Write PREPATCH_COMPLETE marker — consumed by OS patch orchestrator
     local marker="${MARKER_DIR}/PREPATCH_COMPLETE_$(date -u +%Y%m%d-%H%M%S)"
     mkdir -p "${MARKER_DIR}" 2>/dev/null || true
+    local leader_host
+    leader_host="$(hostname)"
+
     cat > "${marker}" <<MARKEREOF
 PREPATCH_COMPLETE
-timestamp_utc: $(ts)
-last_server: $(hostname)
-state_log: ${STATE_LOG}
+timestamp_utc:  $(ts)
+leader_server:  ${leader_host}   ← START THIS NODE FIRST after patching
+state_log:      ${STATE_LOG}
 
 Cluster is fully stopped and ready for OS patch + reboot.
 All cluster nodes should now have rke2-server/rke2-agent stopped and no residual processes.
 
-POST-PATCH CHECKLIST (after cluster restart):
+RESTART ORDER (reverse of stop order — leader first, then others, agents last):
+  1. START  ${leader_host}  first  (was etcd leader — must re-establish quorum)
+     systemctl start rke2-server
+     Wait until:  kubectl get node ${leader_host}  → Ready
+  2. START remaining server nodes (any order)
+     systemctl start rke2-server
+     Wait until each shows Ready before starting the next
+  3. START agent nodes (any order)
+     systemctl start rke2-agent
+
+POST-PATCH CHECKLIST (run from primary server after all nodes are Ready):
   1. Verify all nodes Ready:       kubectl get nodes
-  2. Verify etcd health:           /var/lib/rancher/rke2/bin/etcdctl endpoint health --cluster
+  2. Verify etcd health:           etcdctl --endpoints=https://127.0.0.1:2379 \
+                                     --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \
+                                     --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \
+                                     --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key \
+                                     endpoint health --cluster
   3. Disable maintenance mode:     uipathctl cluster maintenance disable --namespace uipath
   4. Remove nodejanitor label:     kubectl label node <each-node> nodejanitor/skip-
-     (removes the label so nodejanitor resumes normal management)
+     (do this BEFORE uncordoning — so nodejanitor does not re-cordon on uncordon)
   5. Uncordon all nodes:           kubectl uncordon <each-node>
-     NOTE: remove nodejanitor/skip label BEFORE uncordoning, otherwise
-     nodejanitor may re-cordon the node before you finish the checklist.
-  6. Run health check:             uipathctl health check --namespace uipath
+  6. Run preflight again:          ./01-preflight.sh
+  7. Run product health check:     uipathctl health check --namespace uipath
 MARKEREOF
-    state_log "PREPATCH_COMPLETE  $(hostname)  marker=${marker}"
+    state_log "PREPATCH_COMPLETE  $(hostname)  leader=${leader_host}  marker=${marker}"
 
     echo ""
     echo -e "${BOLD}================================================================${RESET}"
     echo -e "${GREEN}${BOLD}  PRE-PATCH PHASE COMPLETE${RESET}"
-    echo -e "${GREEN}${BOLD}  Last server stopped: $(hostname)${RESET}"
+    echo -e "${GREEN}${BOLD}  Last server stopped (etcd leader): ${leader_host}${RESET}"
     echo -e "${GREEN}${BOLD}  Marker written: ${marker}${RESET}"
     echo -e "${BOLD}================================================================${RESET}"
     echo -e "${BOLD}  Cluster is FULLY STOPPED — safe to proceed with OS patch + reboot${RESET}"
+    echo ""
+    echo -e "${YELLOW}${BOLD}  *** RESTART ORDER (after all nodes are patched + rebooted) ***${RESET}"
+    echo -e "${YELLOW}${BOLD}  1. START ${leader_host} FIRST — it was the etcd leader${RESET}"
+    echo -e "${YELLOW}${BOLD}     (re-establishes etcd quorum before other nodes join)${RESET}"
+    echo -e "${YELLOW}${BOLD}  2. Start remaining server nodes (one at a time, wait for Ready)${RESET}"
+    echo -e "${YELLOW}${BOLD}  3. Start agent nodes${RESET}"
+    echo ""
     echo -e "${BOLD}  State log: ${STATE_LOG}${RESET}"
     echo -e "${BOLD}================================================================${RESET}\n"
   else
