@@ -285,40 +285,42 @@ mode_global() {
   info "Ref: https://docs.uipath.com/automation-suite/automation-suite/2024.10/reference-guide/uipathctl-cluster-maintenance-enable"
   echo ""
 
-  # Confirm 01-preflight passed (PF-08 verifies maintenance mode is off)
   local mm_raw
   mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
     --namespace "${UIPATH_NS}" 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
-    fail "Phase A: Maintenance mode is already enabled. Was --global run twice? Check state log."
+    # Idempotent: Phase A already completed (e.g. previous run failed in Phase C).
+    # Skip re-enable and continue to Phase C.
+    pass "Phase A: Maintenance mode already enabled — skipping re-enable, proceeding to Phase C"
+    state_log "MAINTENANCE_ALREADY_ENABLED  $(hostname)  (skip re-enable)"
+  else
+    info "Enabling maintenance mode (namespace: ${UIPATH_NS}, timeout: ${MAINTENANCE_TIMEOUT})..."
+    info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
+    echo ""
+
+    # Suppress logrus INFO[xxxx] and k8s W0601... warnings (stderr); keep stdout ("Successfully enabled...")
+    local enable_stderr="/dev/null"
+    [[ "${VERBOSE}" == "true" ]] && enable_stderr="/dev/stderr"
+
+    if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
+         --namespace "${UIPATH_NS}" \
+         --timeout "${MAINTENANCE_TIMEOUT}" \
+         --force 2>"${enable_stderr}"; then
+      fail "Phase A: uipathctl cluster maintenance enable failed or timed out"
+    fi
+
+    # Verify maintenance mode took effect
+    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
+      --namespace "${UIPATH_NS}" 2>/dev/null || true)
+
+    if ! maintenance_is_enabled "${mm_raw}"; then
+      fail "Phase A: Maintenance mode not confirmed enabled after enable command (is-enabled returned: '${mm_raw}')"
+    fi
+
+    pass "Phase A: Maintenance mode enabled"
+    state_log "MAINTENANCE_ENABLED  $(hostname)"
   fi
-
-  info "Enabling maintenance mode (namespace: ${UIPATH_NS}, timeout: ${MAINTENANCE_TIMEOUT})..."
-  info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
-  echo ""
-
-  # Suppress logrus INFO[xxxx] and k8s W0601... warnings (stderr); keep stdout ("Successfully enabled...")
-  local enable_stderr="/dev/null"
-  [[ "${VERBOSE}" == "true" ]] && enable_stderr="/dev/stderr"
-
-  if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
-       --namespace "${UIPATH_NS}" \
-       --timeout "${MAINTENANCE_TIMEOUT}" \
-       --force 2>"${enable_stderr}"; then
-    fail "Phase A: uipathctl cluster maintenance enable failed or timed out"
-  fi
-
-  # Verify maintenance mode took effect
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
-
-  if ! maintenance_is_enabled "${mm_raw}"; then
-    fail "Phase A: Maintenance mode not confirmed enabled after enable command (is-enabled returned: '${mm_raw}')"
-  fi
-
-  pass "Phase A: Maintenance mode enabled"
-  state_log "MAINTENANCE_ENABLED  $(hostname)"
 
   # Show product pod state
   echo ""
