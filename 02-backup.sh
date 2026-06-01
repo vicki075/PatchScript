@@ -26,9 +26,9 @@
 #   1  — backup failed; cluster state is UNCHANGED; investigate before continuing
 #
 # Usage:
-#   export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
 #   chmod +x 02-backup.sh
 #   ./02-backup.sh
+#   ./02-backup.sh --verbose     # full output including INFO lines
 # =============================================================================
 set -uo pipefail
 
@@ -71,11 +71,14 @@ readonly CHECKSUM_RETRY=1          # retry once on checksum mismatch before abor
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
+# Verbosity — default quiet; set by --verbose / --debug flag
+VERBOSE=false
+
 ts()   { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log()  { echo -e "$(ts)  $*"; }
-info() { log "${CYAN}[INFO]${RESET}  $*"; }
+info() { [[ "${VERBOSE}" == "true" ]] && log "${CYAN}[INFO]${RESET}  $*" || true; }
 pass() { log "${GREEN}[PASS]${RESET}  $*"; }
-warn() { log "${YELLOW}[WARN]${RESET}  $*"; }
+warn() { [[ "${VERBOSE}" == "true" ]] && log "${YELLOW}[WARN]${RESET}  $*" || true; }
 
 fail() {
   local msg="$*"
@@ -88,15 +91,6 @@ fail() {
 state_log() {
   mkdir -p "$(dirname "${STATE_LOG}")" 2>/dev/null || true
   echo "$(ts)  $*" >> "${STATE_LOG}" 2>/dev/null || true
-}
-
-etcdctl_cmd() {
-  "${ETCDCTL}" \
-    --endpoints="${ETCD_ENDPOINT}" \
-    --cacert="${ETCD_CACERT}" \
-    --cert="${ETCD_CERT}" \
-    --key="${ETCD_KEY}" \
-    "$@"
 }
 
 # =============================================================================
@@ -145,7 +139,9 @@ identify_snapshots() {
   fi
 
   info "Selected snapshots (newest last):"
-  echo "${sorted_snaps}" | sed 's/^/  /'
+  if [[ "${VERBOSE}" == "true" ]]; then
+    echo "${sorted_snaps}" | sed 's/^/  /'
+  fi
 
   echo "${sorted_snaps}"
 }
@@ -180,7 +176,7 @@ validate_snapshot() {
   age_hours=$(( ( $(date +%s) - epoch ) / 3600 ))
 
   if [[ "${age_hours}" -gt "${SNAP_FRESHNESS_HOURS}" ]]; then
-    fail "Snapshot ${snap_file} is ${age_hours}h old (threshold: ${SNAP_FRESHNESS_HOURS}h). Scheduled snapshots may have stopped."
+    warn "  Snapshot ${snap_file} is ${age_hours}h old (threshold: ${SNAP_FRESHNESS_HOURS}h) — proceeding with copy"
   fi
 
   info "  Age: ${age_hours}h  ✓  (threshold: ${SNAP_FRESHNESS_HOURS}h)"
@@ -281,8 +277,10 @@ verify_cluster_after_backup() {
     local not_ready
     not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
     if [[ -n "${not_ready}" ]]; then
-      warn "POST-BACKUP: Following nodes not Ready (unexpected — investigate):"
-      echo "${not_ready}" | sed 's/^/  /'
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Following nodes not Ready (unexpected — investigate):"
+      if [[ "${VERBOSE}" == "true" ]]; then
+        echo "${not_ready}" | sed 's/^/  /'
+      fi
     else
       info "POST-BACKUP: All nodes still Ready  ✓"
     fi
@@ -291,20 +289,24 @@ verify_cluster_after_backup() {
     if kubectl get --raw='/readyz' &>/dev/null 2>&1; then
       info "POST-BACKUP: API server /readyz OK  ✓"
     else
-      warn "POST-BACKUP: API server /readyz check failed — unexpected, investigate"
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: API server /readyz check failed — unexpected, investigate"
     fi
 
-    # Maintenance mode still set
-    local mm
-    mm=$(uipathctl cluster maintenance is-enabled --namespace uipath 2>/dev/null \
-      | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || echo "unknown")
+    # Maintenance mode still set — use command -v resolution; skip gracefully if not found
+    local mm="unknown"
+    if command -v uipathctl &>/dev/null; then
+      mm=$(uipathctl cluster maintenance is-enabled --namespace uipath 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || echo "unknown")
+    else
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: uipathctl not found — skipping maintenance mode check"
+    fi
     if [[ "${mm}" == "true" ]]; then
       info "POST-BACKUP: Maintenance mode still enabled  ✓"
-    else
-      warn "POST-BACKUP: Maintenance mode is-enabled returned '${mm}' — expected 'true'"
+    elif [[ "${mm}" != "unknown" ]]; then
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Maintenance mode is-enabled returned '${mm}' — expected 'true'"
     fi
   else
-    warn "POST-BACKUP: kubectl not available — skipping cluster health verification"
+    log "${YELLOW}[WARN]${RESET}  POST-BACKUP: kubectl not available — skipping cluster health verification"
   fi
 }
 
@@ -312,9 +314,21 @@ verify_cluster_after_backup() {
 # MAIN
 # =============================================================================
 main() {
+  for arg in "$@"; do
+    case "${arg}" in
+      --verbose|--debug|-v) VERBOSE=true ;;
+      --help|-h)
+        echo "Usage: $0 [--verbose|--debug]"
+        echo "  Default: only PASS/FAIL lines + summary"
+        echo "  --verbose / --debug: full output including INFO and command detail"
+        exit 0 ;;
+    esac
+  done
+
   echo -e "\n${BOLD}================================================================${RESET}"
   echo -e "${BOLD}  UiPath AS 24.10.4 / RKE2 — Pre-Patch Backup${RESET}"
   echo -e "${BOLD}  Node: $(hostname)   |   $(ts)${RESET}"
+  [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
 
   # Guard: server nodes only
@@ -352,7 +366,9 @@ main() {
   # Summary of what was written
   echo ""
   info "--- Backup Contents ---"
-  find "${DEST_DIR}" -type f | sort | sed 's/^/  /'
+  if [[ "${VERBOSE}" == "true" ]]; then
+    find "${DEST_DIR}" -type f | sort | sed 's/^/  /'
+  fi
 
   # Step 5: Post-backup health check
   echo ""

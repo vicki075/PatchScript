@@ -71,6 +71,13 @@ readonly ETCD_CERT="/var/lib/rancher/rke2/server/tls/etcd/server-client.crt"
 readonly ETCD_KEY="/var/lib/rancher/rke2/server/tls/etcd/server-client.key"
 readonly ETCD_ENDPOINT="https://127.0.0.1:2379"
 
+readonly CRICTL="/var/lib/rancher/rke2/bin/crictl"
+readonly CRI_CONFIG="/var/lib/rancher/rke2/agent/etc/crictl.yaml"
+ETCD_EXEC_MODE=""
+ETCD_CONTAINER_ID=""
+
+UIPATHCTL_BIN=""
+
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 readonly MARKER_DIR="/opt/UiPathAutomationSuite"
 
@@ -84,11 +91,14 @@ readonly KILLALL_TIMEOUT_SECS=120    # 2 min  — abort if rke2-killall.sh hangs
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
+# Verbosity — default quiet; set by --verbose / --debug flag
+VERBOSE=false
+
 ts()   { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log()  { echo -e "$(ts)  $*"; }
-info() { log "${CYAN}[INFO]${RESET}  $*"; }
+info() { [[ "${VERBOSE}" == "true" ]] && log "${CYAN}[INFO]${RESET}  $*" || true; }
 pass() { log "${GREEN}[PASS]${RESET}  $*"; }
-warn() { log "${YELLOW}[WARN]${RESET}  $*"; }
+warn() { [[ "${VERBOSE}" == "true" ]] && log "${YELLOW}[WARN]${RESET}  $*" || true; }
 
 fail() {
   local msg="$*"
@@ -106,13 +116,86 @@ state_log() {
   echo "$(ts)  $*" >> "${STATE_LOG}" 2>/dev/null || true
 }
 
+init_etcd_access() {
+  if [[ -x "${ETCDCTL}" ]]; then
+    ETCD_EXEC_MODE="host"
+    return 0
+  fi
+  if [[ ! -x "${CRICTL}" ]]; then return 1; fi
+  local container_id
+  container_id=$(CRI_CONFIG_FILE="${CRI_CONFIG}" \
+    "${CRICTL}" ps --label io.kubernetes.container.name=etcd --quiet 2>/dev/null | head -1)
+  if [[ -z "${container_id}" ]]; then return 1; fi
+  ETCD_EXEC_MODE="container"
+  ETCD_CONTAINER_ID="${container_id}"
+  return 0
+}
+
 etcdctl_cmd() {
-  "${ETCDCTL}" \
-    --endpoints="${ETCD_ENDPOINT}" \
-    --cacert="${ETCD_CACERT}" \
-    --cert="${ETCD_CERT}" \
-    --key="${ETCD_KEY}" \
-    "$@"
+  case "${ETCD_EXEC_MODE}" in
+    host)
+      "${ETCDCTL}" \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "$@"
+      ;;
+    container)
+      CRI_CONFIG_FILE="${CRI_CONFIG}" \
+      "${CRICTL}" exec -i "${ETCD_CONTAINER_ID}" \
+        etcdctl \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "$@"
+      ;;
+    *)
+      echo "etcdctl not available" >&2; return 1 ;;
+  esac
+}
+
+resolve_uipathctl() {
+  if command -v uipathctl &>/dev/null; then
+    UIPATHCTL_BIN="$(command -v uipathctl)"
+    return 0
+  fi
+
+  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
+    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+    if [[ -x "${candidate}" ]]; then
+      UIPATHCTL_BIN="${candidate}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    else
+      warn "UIPATH_INSTALLER_DIR='${UIPATH_INSTALLER_DIR}' set but ${candidate} not found/executable"
+    fi
+  fi
+
+  local known_paths=(
+    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
+  )
+  local p
+  for p in "${known_paths[@]}"; do
+    if [[ -x "${p}" ]]; then
+      UIPATHCTL_BIN="${p}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    fi
+  done
+
+  local found
+  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null \
+    | head -1)
+  if [[ -n "${found}" && -x "${found}" ]]; then
+    UIPATHCTL_BIN="${found}"
+    export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+    return 0
+  fi
+
+  return 1
 }
 
 usage() {
@@ -135,16 +218,18 @@ usage() {
 mode_identify_leader() {
   echo -e "\n${BOLD}--- Identifying etcd leader ---${RESET}"
 
-  if [[ ! -x "${ETCDCTL}" ]]; then
-    fail "--identify-leader: etcdctl not found at ${ETCDCTL}"
+  if ! init_etcd_access; then
+    fail "--identify-leader: etcdctl not available (no host binary and no etcd container via crictl)"
   fi
 
-  info "etcd endpoint status (cluster-wide):"
-  etcdctl_cmd endpoint status --cluster -w table 2>/dev/null | sed 's/^/  /' \
-    || fail "--identify-leader: etcdctl endpoint status failed"
+  if [[ "${VERBOSE}" == "true" ]]; then
+    info "etcd endpoint status (cluster-wide):"
+    etcdctl_cmd endpoint status --cluster -w table 2>/dev/null | sed 's/^/  /' \
+      || fail "--identify-leader: etcdctl endpoint status failed"
+    echo ""
+  fi
 
-  echo ""
-  info "Leader summary:"
+  log "${CYAN}[INFO]${RESET}  Leader summary:"
   etcdctl_cmd endpoint status --cluster -w json 2>/dev/null \
     | python3 -c "
 import json, sys
@@ -152,10 +237,12 @@ data = json.load(sys.stdin)
 for e in data:
     ep = e.get('Endpoint','?')
     st = e.get('Status', {})
-    is_leader = st.get('isLeader', False)
+    member_id = st.get('header', {}).get('member_id', -1)
+    leader_id  = st.get('leader', -2)
+    is_leader  = (member_id == leader_id)
     label = '  <<< LEADER — stop this server LAST' if is_leader else ''
     print(f'  {ep}{label}')
-" 2>/dev/null || warn "Could not parse leader from JSON output — check table above"
+" 2>/dev/null || log "${YELLOW}[WARN]${RESET}  Could not parse leader from JSON output — re-run with --verbose for table"
 
   echo ""
 }
@@ -175,9 +262,10 @@ mode_global() {
     fail "--global: kubectl not available. Run from the primary server node with KUBECONFIG set."
   fi
 
-  if ! command -v uipathctl &>/dev/null; then
-    fail "--global: uipathctl not found in PATH"
+  if ! resolve_uipathctl; then
+    fail "--global: uipathctl not found — set UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer"
   fi
+  info "uipathctl: ${UIPATHCTL_BIN}"
 
   # ---- Phase A: Enable Maintenance Mode ----
   echo -e "${BOLD}--- Phase A: Enable UiPath Maintenance Mode ---${RESET}"
@@ -186,7 +274,7 @@ mode_global() {
 
   # Confirm 01-preflight passed (PF-08 verifies maintenance mode is off)
   local mm_state
-  mm_state=$(uipathctl cluster maintenance is-enabled \
+  mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
     --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
   if [[ "${mm_state}" == "true" ]]; then
@@ -194,10 +282,10 @@ mode_global() {
   fi
 
   info "Enabling maintenance mode (namespace: ${UIPATH_NS}, timeout: ${MAINTENANCE_TIMEOUT})..."
-  info "Command: uipathctl cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
+  info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
   echo ""
 
-  if ! uipathctl cluster maintenance enable \
+  if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
        --namespace "${UIPATH_NS}" \
        --timeout "${MAINTENANCE_TIMEOUT}" \
        --force; then
@@ -205,7 +293,7 @@ mode_global() {
   fi
 
   # Verify maintenance mode took effect
-  mm_state=$(uipathctl cluster maintenance is-enabled \
+  mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
     --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
   if [[ "${mm_state}" != "true" ]]; then
@@ -218,15 +306,19 @@ mode_global() {
   # Show product pod state
   echo ""
   info "Product deployment state in namespace ${UIPATH_NS} (expect replicas→0):"
-  kubectl get deploy -n "${UIPATH_NS}" \
-    -o custom-columns='NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas' \
-    2>/dev/null | sed 's/^/  /' || true
+  if [[ "${VERBOSE}" == "true" ]]; then
+    kubectl get deploy -n "${UIPATH_NS}" \
+      -o custom-columns='NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas' \
+      2>/dev/null | sed 's/^/  /' || true
+  fi
 
   echo ""
   info "Non-zero replica deployments remaining (expect none for product services):"
-  kubectl get deploy -n "${UIPATH_NS}" --no-headers 2>/dev/null \
-    | awk '$2 != "0" && $2 != "<none>" {print}' \
-    | sed 's/^/  /' || true
+  if [[ "${VERBOSE}" == "true" ]]; then
+    kubectl get deploy -n "${UIPATH_NS}" --no-headers 2>/dev/null \
+      | awk '$2 != "0" && $2 != "<none>" {print}' \
+      | sed 's/^/  /' || true
+  fi
 
   # ---- Phase C: Cordon All Nodes ----
   echo ""
@@ -267,7 +359,9 @@ mode_global() {
 
   echo ""
   info "Verifying all nodes show SchedulingDisabled and carry nodejanitor/skip=true..."
-  kubectl get nodes --show-labels 2>/dev/null | sed 's/^/  /'
+  if [[ "${VERBOSE}" == "true" ]]; then
+    kubectl get nodes --show-labels 2>/dev/null | sed 's/^/  /'
+  fi
 
   # Verify: no node missing SchedulingDisabled
   local not_cordoned
@@ -348,9 +442,9 @@ drain_this_node() {
   # Brief wait for pod eviction to propagate
   sleep 5
 
-  info "Drain step complete on $(hostname)"
-  info "  --> OPERATOR ACTION: Verify from primary server node that no non-DaemonSet pods remain:"
-  info "      kubectl get pods -A --field-selector spec.nodeName=$(hostname) | grep -v -E 'Completed|DaemonSet'"
+  log "${CYAN}[INFO]${RESET}  Drain step complete on $(hostname)"
+  log "${CYAN}[INFO]${RESET}    --> OPERATOR ACTION: Verify from primary server node that no non-DaemonSet pods remain:"
+  log "${CYAN}[INFO]${RESET}        kubectl get pods -A --field-selector spec.nodeName=$(hostname) | grep -v -E 'Completed|DaemonSet'"
 }
 
 # =============================================================================
@@ -463,8 +557,8 @@ mode_stop_server() {
     return 0
   fi
 
-  if [[ ! -x "${ETCDCTL}" ]]; then
-    fail "--stop-server: etcdctl not found at ${ETCDCTL}"
+  if ! init_etcd_access; then
+    fail "--stop-server: etcdctl not available (no host binary and no etcd container via crictl)"
   fi
 
   # Step 1: Determine if this is the final server node
@@ -475,7 +569,9 @@ mode_stop_server() {
   healthy_count=$(echo "${health_output}" | grep -c "is healthy" || echo "0")
 
   info "Healthy etcd endpoints visible from $(hostname): ${healthy_count}"
-  echo "${health_output}" | sed 's/^/  /'
+  if [[ "${VERBOSE}" == "true" ]]; then
+    echo "${health_output}" | sed 's/^/  /'
+  fi
   echo ""
 
   local is_last_server=false
@@ -527,7 +623,7 @@ last_server: $(hostname)
 state_log: ${STATE_LOG}
 
 Cluster is fully stopped and ready for OS patch + reboot.
-All 6 nodes should now have rke2-server/rke2-agent stopped and no residual processes.
+All cluster nodes should now have rke2-server/rke2-agent stopped and no residual processes.
 
 POST-PATCH CHECKLIST (after cluster restart):
   1. Verify all nodes Ready:       kubectl get nodes
@@ -567,7 +663,20 @@ MARKEREOF
 # MAIN — argument dispatch
 # =============================================================================
 main() {
-  local mode="${1:---global}"
+  local mode=""
+
+  for arg in "$@"; do
+    case "${arg}" in
+      --verbose|--debug|-v) VERBOSE=true ;;
+      --global|--stop-agent|--stop-server|--identify-leader) mode="${arg}" ;;
+      --help|-h) usage; exit 0 ;;
+      *) echo -e "${RED}Unknown argument: ${arg}${RESET}"; usage; exit 1 ;;
+    esac
+  done
+
+  [[ -z "${mode}" ]] && mode="--global"
+
+  [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
 
   case "${mode}" in
     --global)
@@ -581,15 +690,6 @@ main() {
       ;;
     --identify-leader)
       mode_identify_leader
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      echo -e "${RED}Unknown argument: ${mode}${RESET}"
-      usage
-      exit 1
       ;;
   esac
 }
