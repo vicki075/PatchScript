@@ -10,9 +10,11 @@
 
 | Script | Purpose | Run on |
 |---|---|---|
-| `01-preflight.sh` | Validates cluster is healthy before anything is touched | Primary server (full) + every node (local checks) |
+| `01-preflight.sh` | Validates cluster is healthy before anything is touched | **Primary server only — once, before any phase starts** |
 | `02-backup.sh` | Copies last 2 etcd snapshots + RKE2 config to a local backup dir | Each server node |
 | `03-prepatch.sh` | Enables maintenance mode, cordons nodes, then shuts down each node cleanly | Mode-dependent — see below |
+
+> **Why preflight runs only once:** `01-preflight.sh` checks cluster-level state — node readiness, etcd health, API server, pod health, maintenance mode. All of these are only meaningful before the patch window opens. Once Phase A+C have run and nodes are being stopped, the cluster *is supposed to* look degraded (nodes NotReady, all cordoned, reduced etcd membership). Running preflight mid-patch will always produce false failures. Disk space and RKE2 package-pin checks on non-primary nodes are covered by `02-backup.sh` and `03-prepatch.sh` themselves at runtime.
 
 **What they do NOT do:** OS patch, reboot, upgrade RKE2 binaries, bring the cluster back up.
 
@@ -112,17 +114,22 @@ Works for any cluster shape: `3+0`, `3+1`, `3+3`, `5+2`, `7+0`, etc.
 ## Execution order
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 1  Pre-flight checks                                      │
-│  STEP 2  Enable maintenance mode + cordon all nodes             │
-│  STEP 3  Backups (etcd snapshots + rke2 config)                 │
-│  STEP 4  Stop agent nodes  (one at a time, if any agents exist) │
-│  STEP 5  Stop server nodes (non-leader first, leader last)      │
-│                                                                 │
-│  → OS patch + reboot each node ←                               │
-│                                                                 │
-│  STEP 6  Start leader server FIRST, then other servers, agents  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  STEP 1  Pre-flight checks          ← PRIMARY SERVER ONLY — run once     │
+│  STEP 2  Enable maintenance mode                                         │
+│          + cordon all nodes         ← primary server only — run once     │
+│  STEP 3  Backups (etcd snapshots                                         │
+│          + rke2 config)             ← each SERVER node (any order)       │
+│  STEP 4  Stop agent nodes           ← each AGENT node, one at a time     │
+│          (skip if no agents)                                             │
+│  STEP 5  Stop server nodes          ← each SERVER node, one at a time    │
+│          non-leader first,                                               │
+│          leader last                                                     │
+│                                                                          │
+│  → OS patch + reboot each node ←                                         │
+│                                                                          │
+│  STEP 6  Start leader server FIRST, then other servers, agents           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why leader last / leader first?
@@ -137,11 +144,15 @@ The same logic applies in reverse on restart: starting the leader first re-estab
 
 ### STEP 1 — Pre-flight checks
 
-Run from the **primary server node**. All 9 checks run regardless of individual failures; a consolidated summary is printed at the end.
+Run from the **primary server node only — once, before anything else starts**.
+
+All 9 checks run regardless of individual failures; a consolidated summary is printed at the end.
 
 ```bash
 ./01-preflight.sh
 ```
+
+> **Do not run preflight on subsequent nodes or mid-patch.** Once Phase A+C have started and nodes are being stopped, the cluster is intentionally degraded — nodes will be NotReady, all cordoned, etcd membership reduced. These are correct conditions, not problems. Disk space and package-pin on non-primary nodes are checked automatically by `02-backup.sh` and `03-prepatch.sh` at the point each script runs.
 
 **Expected output (primary server, clean cluster):**
 ```
@@ -170,11 +181,6 @@ If only warnings are present (pre-existing app issues, advisory disk):
 
 > **Stop here if any `[FAIL]` appears.** Exit code 1, failures written to  
 > `/opt/UiPathAutomationSuite/prepatch-state.log`. Resolve all failures and re-run before proceeding.
-
-Also run on every non-primary node for local checks (PF-05 disk, PF-06 package pin):
-```bash
-./01-preflight.sh          # on each remaining node
-```
 
 ---
 
@@ -420,28 +426,26 @@ uipathctl health check --namespace uipath --timeout 10m
 ## Quick reference — command summary
 
 ```bash
-# Full pre-flight (primary server)
+# ── STEP 1: Pre-flight — PRIMARY SERVER ONLY, once before anything starts ──
 ./01-preflight.sh
+./01-preflight.sh --verbose   # with full detail
 
-# Full pre-flight with verbose output
-./01-preflight.sh --verbose
-
-# Enable maintenance mode + cordon all nodes (primary server; idempotent)
+# ── STEP 2: Enable maintenance mode + cordon all nodes — PRIMARY SERVER ONLY ──
 ./03-prepatch.sh --global
 
-# Backup snapshots + config (each server node, locally)
+# ── STEP 3: Backup — each SERVER node locally (any order) ──
 ./02-backup.sh
 
-# Stop each agent (locally on each agent, sequential — skip if no agents)
+# ── STEP 4: Stop each agent — locally on each AGENT, sequential (skip if none) ──
 ./03-prepatch.sh --stop-agent
 
-# Identify etcd leader at any time (any server node)
+# ── Identify etcd leader at any time (any server node with etcdctl access) ──
 ./03-prepatch.sh --identify-leader
 
-# Stop each server (locally on each server, non-leader first, leader last)
+# ── STEP 5: Stop each server — locally on each SERVER, non-leader first, leader last ──
 ./03-prepatch.sh --stop-server
 
-# Override uipathctl path if not auto-discovered
+# ── Override uipathctl path if not auto-discovered ──
 UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh
 ```
 
