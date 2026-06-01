@@ -94,6 +94,50 @@ state_log() {
 }
 
 # =============================================================================
+# UIPATHCTL RESOLUTION — mirrors 01-preflight.sh
+# =============================================================================
+UIPATHCTL_BIN=""
+
+resolve_uipathctl() {
+  if command -v uipathctl &>/dev/null; then
+    UIPATHCTL_BIN="$(command -v uipathctl)"
+    return 0
+  fi
+
+  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
+    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+    if [[ -x "${candidate}" ]]; then
+      UIPATHCTL_BIN="${candidate}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    fi
+  fi
+
+  local known_paths=(
+    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
+  )
+  local p
+  for p in "${known_paths[@]}"; do
+    if [[ -x "${p}" ]]; then
+      UIPATHCTL_BIN="${p}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    fi
+  done
+
+  local found
+  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null | head -1)
+  if [[ -n "${found}" && -x "${found}" ]]; then
+    UIPATHCTL_BIN="${found}"
+    export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+    return 0
+  fi
+
+  return 1
+}
+
+# =============================================================================
 # GUARD: must run on a server node
 # =============================================================================
 guard_server_node() {
@@ -292,13 +336,15 @@ verify_cluster_after_backup() {
       log "${YELLOW}[WARN]${RESET}  POST-BACKUP: API server /readyz check failed — unexpected, investigate"
     fi
 
-    # Maintenance mode still set — use command -v resolution; skip gracefully if not found
+    # Maintenance mode still set
     local mm="unknown"
-    if command -v uipathctl &>/dev/null; then
-      mm=$(uipathctl cluster maintenance is-enabled --namespace uipath 2>/dev/null \
+    if [[ -n "${UIPATHCTL_BIN}" ]] || resolve_uipathctl; then
+      mm=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled --namespace uipath 2>/dev/null \
         | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || echo "unknown")
     else
       log "${YELLOW}[WARN]${RESET}  POST-BACKUP: uipathctl not found — skipping maintenance mode check"
+      log "${YELLOW}[WARN]${RESET}          Try: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
+      log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
     fi
     if [[ "${mm}" == "true" ]]; then
       info "POST-BACKUP: Maintenance mode still enabled  ✓"
@@ -330,6 +376,16 @@ main() {
   echo -e "${BOLD}  Node: $(hostname)   |   $(ts)${RESET}"
   [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
+
+  # Resolve uipathctl once; verify_cluster_after_backup() uses UIPATHCTL_BIN
+  if resolve_uipathctl; then
+    info "uipathctl resolved: ${UIPATHCTL_BIN}"
+  else
+    log "${YELLOW}[WARN]${RESET}  uipathctl not found — maintenance mode check will be skipped"
+    log "${YELLOW}[WARN]${RESET}          To enable: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
+    log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  fi
+  echo ""
 
   # Guard: server nodes only
   guard_server_node
