@@ -116,6 +116,19 @@ state_log() {
   echo "$(ts)  $*" >> "${STATE_LOG}" 2>/dev/null || true
 }
 
+# maintenance_is_enabled <raw-output>
+# Returns 0 if maintenance mode is on, 1 if off.
+# Handles both boolean output ("true"/"false") and descriptive strings
+# ("Maintenance mode is enabled" / "Maintenance mode is not enabled").
+maintenance_is_enabled() {
+  local raw="$1"
+  # Explicit negatives take priority
+  echo "${raw}" | grep -qi "not\|false\|disabled" && return 1
+  # Positive match
+  echo "${raw}" | grep -qi "true\|enabled" && return 0
+  return 1
+}
+
 init_etcd_access() {
   if [[ -x "${ETCDCTL}" ]]; then
     ETCD_EXEC_MODE="host"
@@ -273,11 +286,11 @@ mode_global() {
   echo ""
 
   # Confirm 01-preflight passed (PF-08 verifies maintenance mode is off)
-  local mm_state
-  mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  local mm_raw
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
+    --namespace "${UIPATH_NS}" 2>/dev/null || true)
 
-  if [[ "${mm_state}" == "true" ]]; then
+  if maintenance_is_enabled "${mm_raw}"; then
     fail "Phase A: Maintenance mode is already enabled. Was --global run twice? Check state log."
   fi
 
@@ -285,19 +298,23 @@ mode_global() {
   info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
   echo ""
 
+  # Suppress logrus INFO[xxxx] and k8s W0601... warnings (stderr); keep stdout ("Successfully enabled...")
+  local enable_stderr="/dev/null"
+  [[ "${VERBOSE}" == "true" ]] && enable_stderr="/dev/stderr"
+
   if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
        --namespace "${UIPATH_NS}" \
        --timeout "${MAINTENANCE_TIMEOUT}" \
-       --force; then
+       --force 2>"${enable_stderr}"; then
     fail "Phase A: uipathctl cluster maintenance enable failed or timed out"
   fi
 
   # Verify maintenance mode took effect
-  mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
+    --namespace "${UIPATH_NS}" 2>/dev/null || true)
 
-  if [[ "${mm_state}" != "true" ]]; then
-    fail "Phase A: is-enabled returned '${mm_state}' after enable command — unexpected"
+  if ! maintenance_is_enabled "${mm_raw}"; then
+    fail "Phase A: Maintenance mode not confirmed enabled after enable command (is-enabled returned: '${mm_raw}')"
   fi
 
   pass "Phase A: Maintenance mode enabled"

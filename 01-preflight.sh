@@ -635,10 +635,15 @@ pf08_no_active_operation() {
     # uipathctl already caught as FAIL in PF-07; skip maintenance check to avoid double-reporting
     info "PF-08: Skipping maintenance mode check — uipathctl not found (see PF-07)"
   else
-    local mm_state
-    mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-      --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    if [[ "${mm_state}" == "true" ]]; then
+    # is-enabled may return "true"/"false" or a descriptive string like
+    # "Maintenance mode is enabled" — check both forms; negatives take priority
+    local mm_raw mm_on=false
+    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
+      --namespace "${UIPATH_NS}" 2>/dev/null || true)
+    if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
+      echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
+    fi
+    if [[ "${mm_on}" == "true" ]]; then
       check_fail "PF-08" "Maintenance mode already enabled — investigate stale state before proceeding"
       pf08_ok=false
     fi
