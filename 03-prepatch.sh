@@ -477,13 +477,11 @@ print('\n'.join(
 #   installation-guide/starting-and-shutting-down-a-node
 # =============================================================================
 drain_this_node() {
-  info "Draining node $(hostname) via node-drain.service (timeout: ${DRAIN_TIMEOUT_SECS}s)..."
+  log "  Running: systemctl stop node-drain.service  (timeout: ${DRAIN_TIMEOUT_SECS}s)"
   info "Ref: https://docs.uipath.com/automation-suite/automation-suite/2024.10/installation-guide/starting-and-shutting-down-a-node"
 
   if ! systemctl is-active --quiet node-drain.service 2>/dev/null; then
-    warn "node-drain.service is not currently active — may already be stopped or not present"
-    warn "If this is unexpected, investigate before continuing"
-    # Don't abort — service may legitimately be inactive if already drained
+    log "${YELLOW}[WARN]${RESET}  node-drain.service is not active on $(hostname) — skipping drain (may already be drained or not installed)"
     return 0
   fi
 
@@ -494,7 +492,7 @@ drain_this_node() {
   # Brief wait for pod eviction to propagate
   sleep 5
 
-  log "${CYAN}[INFO]${RESET}  Drain step complete on $(hostname)"
+  pass "node-drain.service stopped  ✓"
   log "${CYAN}[INFO]${RESET}    --> OPERATOR ACTION: Verify from primary server node that no non-DaemonSet pods remain:"
   log "${CYAN}[INFO]${RESET}        kubectl get pods -A --field-selector spec.nodeName=$(hostname) | grep -v -E 'Completed|DaemonSet'"
 }
@@ -503,7 +501,7 @@ drain_this_node() {
 # SHARED: verify no residual rke2/containerd/kubelet processes
 # =============================================================================
 verify_clean_stop() {
-  info "Verifying no residual rke2 / containerd / kubelet processes on $(hostname)..."
+  log "  Verifying no residual rke2 / containerd / kubelet processes on $(hostname)..."
   sleep 3
 
   local residual
@@ -537,11 +535,24 @@ mode_stop_agent() {
   fi
 
   if ! systemctl is-active --quiet rke2-agent 2>/dev/null; then
-    warn "rke2-agent is not currently active on $(hostname) — may already be stopped"
-    info "Checking for residual processes anyway..."
+    log "  rke2-agent is not active on $(hostname) — may have been stopped by a prior run"
+    # Prior run may have stopped rke2-agent but failed before rke2-killall.sh ran.
+    # Run killall now if residuals remain so the operator doesn't have to clean manually.
+    local residual_early
+    residual_early=$(ps aux 2>/dev/null \
+      | grep -E 'containerd|kubelet|rke2' \
+      | grep -v grep \
+      | grep -v "03-prepatch" || true)
+    if [[ -n "${residual_early}" ]]; then
+      log "  Residual processes found — running rke2-killall.sh to clean up (timeout: ${KILLALL_TIMEOUT_SECS}s)"
+      if ! timeout "${KILLALL_TIMEOUT_SECS}" rke2-killall.sh 2>&1; then
+        fail "KILLALL_FAIL: rke2-killall.sh did not complete within ${KILLALL_TIMEOUT_SECS}s on $(hostname)"
+      fi
+      pass "rke2-killall.sh complete  ✓"
+    fi
     verify_clean_stop
     state_log "AGENT_STOPPED  $(hostname)  (was already stopped)"
-    pass "Agent node $(hostname) already stopped — no action needed"
+    pass "Agent node $(hostname) already stopped and clean"
     return 0
   fi
 
@@ -550,25 +561,20 @@ mode_stop_agent() {
   echo ""
 
   # Step 2: Stop rke2-agent
-  info "Stopping rke2-agent (timeout: ${STOP_TIMEOUT_SECS}s)..."
+  log "  Running: systemctl stop rke2-agent  (timeout: ${STOP_TIMEOUT_SECS}s)"
   if ! timeout "${STOP_TIMEOUT_SECS}" systemctl stop rke2-agent 2>&1; then
     fail "STOP_HANG: rke2-agent did not stop within ${STOP_TIMEOUT_SECS}s on $(hostname). DO NOT run rke2-killall.sh. Investigate."
   fi
-
-  local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    fail "STOP_HANG: systemctl stop rke2-agent exited ${rc} on $(hostname)"
-  fi
-  info "rke2-agent stopped  ✓"
+  pass "rke2-agent stopped  ✓"
   echo ""
 
   # Step 3: rke2-killall.sh — clear residual containerd/kubelet and unmount pod mounts
   # Safe to run ONLY after drain + systemctl stop. Never before.
-  info "Running rke2-killall.sh to clear residual containerd/kubelet processes and unmount pod mounts..."
-  if ! timeout "${KILLALL_TIMEOUT_SECS}" /var/lib/rancher/rke2/bin/rke2-killall.sh 2>&1; then
+  log "  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)"
+  if ! timeout "${KILLALL_TIMEOUT_SECS}" rke2-killall.sh 2>&1; then
     fail "KILLALL_FAIL: rke2-killall.sh did not complete within ${KILLALL_TIMEOUT_SECS}s on $(hostname)"
   fi
-  info "rke2-killall.sh complete  ✓"
+  pass "rke2-killall.sh complete  ✓"
   echo ""
 
   # Step 4: Verify clean
@@ -600,12 +606,24 @@ mode_stop_server() {
 
   # Guard: must be a server node
   if ! systemctl is-active --quiet rke2-server 2>/dev/null; then
-    # Check if already stopped
-    warn "rke2-server is not active on $(hostname)"
-    info "Checking for residual processes..."
+    log "  rke2-server is not active on $(hostname) — may have been stopped by a prior run"
+    # Prior run may have stopped rke2-server but failed before rke2-killall.sh ran
+    # (e.g. script interrupted, PATH issue). Run killall now if residuals remain.
+    local residual_early
+    residual_early=$(ps aux 2>/dev/null \
+      | grep -E 'containerd|kubelet|rke2' \
+      | grep -v grep \
+      | grep -v "03-prepatch" || true)
+    if [[ -n "${residual_early}" ]]; then
+      log "  Residual processes found — running rke2-killall.sh to clean up (timeout: ${KILLALL_TIMEOUT_SECS}s)"
+      if ! timeout "${KILLALL_TIMEOUT_SECS}" rke2-killall.sh 2>&1; then
+        fail "KILLALL_FAIL: rke2-killall.sh did not complete within ${KILLALL_TIMEOUT_SECS}s on $(hostname)"
+      fi
+      pass "rke2-killall.sh complete  ✓"
+    fi
     verify_clean_stop
     state_log "SERVER_STOPPED  $(hostname)  (was already stopped)"
-    pass "Server node $(hostname) already stopped — no action needed"
+    pass "Server node $(hostname) already stopped and clean"
     return 0
   fi
 
@@ -643,19 +661,19 @@ mode_stop_server() {
   echo ""
 
   # Step 3: Stop rke2-server
-  info "Stopping rke2-server (timeout: ${STOP_TIMEOUT_SECS}s)..."
+  log "  Running: systemctl stop rke2-server  (timeout: ${STOP_TIMEOUT_SECS}s)"
   if ! timeout "${STOP_TIMEOUT_SECS}" systemctl stop rke2-server 2>&1; then
     fail "STOP_HANG: rke2-server did not stop within ${STOP_TIMEOUT_SECS}s on $(hostname). DO NOT run rke2-killall.sh. Investigate."
   fi
-  info "rke2-server stopped  ✓"
+  pass "rke2-server stopped  ✓"
   echo ""
 
   # Step 4: rke2-killall.sh
-  info "Running rke2-killall.sh to clear residual containerd/kubelet processes and unmount pod mounts..."
-  if ! timeout "${KILLALL_TIMEOUT_SECS}" /var/lib/rancher/rke2/bin/rke2-killall.sh 2>&1; then
+  log "  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)"
+  if ! timeout "${KILLALL_TIMEOUT_SECS}" rke2-killall.sh 2>&1; then
     fail "KILLALL_FAIL: rke2-killall.sh did not complete within ${KILLALL_TIMEOUT_SECS}s on $(hostname)"
   fi
-  info "rke2-killall.sh complete  ✓"
+  pass "rke2-killall.sh complete  ✓"
   echo ""
 
   # Step 5: Verify clean
