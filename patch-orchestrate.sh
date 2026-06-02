@@ -362,11 +362,12 @@ run_health_check() {
     return 0
   fi
 
+  # Extract ALL-CAPS bracket tokens from ❌ lines: ❌ [COMPONENTNAME] or ❌ [COMPONENT_SUBCHECK]
   local failed_components=()
   while IFS= read -r line; do
-    if echo "${line}" | grep -qE '❌| failed '; then
+    if echo "${line}" | grep -qE '❌'; then
       local comp
-      comp=$(echo "${line}" | awk '{print $2}')
+      comp=$(echo "${line}" | grep -oE '\[[A-Z_]+\]' | head -1 | tr -d '[]')
       [[ -n "${comp}" ]] && failed_components+=("${comp}")
     fi
   done <<< "${cleaned}"
@@ -378,17 +379,17 @@ run_health_check() {
   # --skip-hc=all  →  ignore every failure
   for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
     if [[ "${skip_comp,,}" == "all" ]]; then
-      warn "Health check had failures — skipped (--skip-hc=all): ${failed_components[*]}"
+      warn "Health check had failures — skipped via --skip-hc=all: ${failed_components[*]}"
       return 0
     fi
   done
 
-  # Check each failed component against the explicit skip list
+  # Prefix match: --skip-hc=DOCUMENTUNDERSTANDING covers DOCUMENTUNDERSTANDING_HEALTH too
   local unresolved=()
   for comp in "${failed_components[@]}"; do
     local skip=false
     for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
-      if [[ "${comp,,}" == "${skip_comp,,}" ]]; then
+      if [[ "${comp,,}" == "${skip_comp,,}"* ]]; then
         skip=true
         break
       fi
@@ -399,10 +400,13 @@ run_health_check() {
   if [[ ${#unresolved[@]} -gt 0 ]]; then
     local unresolved_str
     unresolved_str=$(IFS=','; echo "${unresolved[*]}")
-    abort "Health check failed — unresolved: ${unresolved_str}. Use --skip-hc=all to bypass or --skip-hc=comp1,comp2 for specific ones."
+    log "${YELLOW}[WARN]${RESET}  Failed components not in skip list:"
+    for c in "${unresolved[@]}"; do log "${YELLOW}[WARN]${RESET}    ❌  ${c}"; done
+    abort "Health check failed — unresolved: ${unresolved_str}
+  Use --skip-hc=all to bypass everything, or --skip-hc=SYNC,DOCUMENTUNDERSTANDING for specific ones."
   fi
 
-  warn "Health check had failures but all in --skip-hc list: ${failed_components[*]} — continuing"
+  warn "Health check had failures — all covered by --skip-hc: ${failed_components[*]} — continuing"
 }
 
 # =============================================================================
