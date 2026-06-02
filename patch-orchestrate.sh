@@ -551,8 +551,16 @@ stop_agent_node() {
   local node="$1"
   echo -e "\n${BOLD}--- Stop Agent Node: ${node} ---${RESET}"
 
-  # Drain via local kubectl
-  log "  Draining ${node}..."
+  # Step 1 (UiPath docs): stop node-drain.service on the remote node
+  log "  Running on ${node}: systemctl stop node-drain.service"
+  if remote "${node}" "timeout 60 systemctl stop node-drain.service 2>/dev/null"; then
+    pass "  node-drain.service stopped on ${node}"
+  else
+    warn "  node-drain.service not running or not found on ${node} — continuing"
+  fi
+
+  # Step 1b: Kubernetes-level pod eviction (local kubectl)
+  log "  Running: kubectl drain ${node} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
   if ! kubectl drain "${node}" \
        --ignore-daemonsets \
        --delete-emptydir-data \
@@ -562,34 +570,46 @@ stop_agent_node() {
   fi
   pass "  Drain complete: ${node}"
 
-  # SSH: stop rke2-agent + killall
-  log "  Stopping rke2-agent on ${node} via SSH..."
+  # Step 2 (UiPath docs): stop the Kubernetes process + Step 3: killall
+  log "  Running on ${node}: systemctl stop rke2-agent + rke2-killall.sh"
   remote "${node}" "
-set -uo pipefail
-echo 'Stopping rke2-agent...'
-timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-agent 2>&1 || echo 'WARN: rke2-agent stop returned non-zero'
-echo 'Running rke2-killall.sh...'
-timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo 'WARN: rke2-killall.sh returned non-zero'
+export PATH=\"\$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin\"
+echo '  Running: systemctl stop rke2-agent  (timeout: ${STOP_TIMEOUT_SECS}s)'
+if timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-agent 2>&1; then
+  echo '[PASS]  rke2-agent stopped'
+else
+  echo '[WARN]  rke2-agent stop returned non-zero — continuing to killall'
+fi
+echo '  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)'
+timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo '[WARN]  rke2-killall.sh returned non-zero'
+echo '[PASS]  rke2-killall.sh complete'
 residual=\$(ps aux 2>/dev/null | grep -E 'containerd|kubelet|rke2' | grep -v grep | grep -v patch-orchestrate || true)
 if [[ -n \"\${residual}\" ]]; then
-  echo 'WARN: residual processes remain:'
-  echo \"\${residual}\"
+  echo '[WARN]  Residual processes remain on \$(hostname):'
+  echo \"\${residual}\" | sed 's/^/    /'
 else
-  echo 'No residual processes.'
+  echo '[PASS]  No residual rke2/containerd/kubelet processes on \$(hostname)'
 fi
-echo 'AGENT_STOPPED'
 " || warn "  SSH stop command returned non-zero for ${node}"
 
   state_log "AGENT_STOPPED  ${node}  (orchestrated)"
-  pass "  Agent node stopped: ${node}"
+  pass "  Agent node ${node}: stopped"
 }
 
 stop_server_node() {
   local node="$1"
   echo -e "\n${BOLD}--- Stop Server Node: ${node} ---${RESET}"
 
-  # Drain via local kubectl
-  log "  Draining ${node}..."
+  # Step 1 (UiPath docs): stop node-drain.service on the remote node
+  log "  Running on ${node}: systemctl stop node-drain.service"
+  if remote "${node}" "timeout 60 systemctl stop node-drain.service 2>/dev/null"; then
+    pass "  node-drain.service stopped on ${node}"
+  else
+    warn "  node-drain.service not running or not found on ${node} — continuing"
+  fi
+
+  # Step 1b: Kubernetes-level pod eviction (local kubectl)
+  log "  Running: kubectl drain ${node} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
   if ! kubectl drain "${node}" \
        --ignore-daemonsets \
        --delete-emptydir-data \
@@ -599,26 +619,30 @@ stop_server_node() {
   fi
   pass "  Drain complete: ${node}"
 
-  # SSH: stop rke2-server + killall
-  log "  Stopping rke2-server on ${node} via SSH..."
+  # Step 2 (UiPath docs): stop the Kubernetes process + Step 3: killall
+  log "  Running on ${node}: systemctl stop rke2-server + rke2-killall.sh"
   remote "${node}" "
-set -uo pipefail
-echo 'Stopping rke2-server...'
-timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-server 2>&1 || echo 'WARN: rke2-server stop returned non-zero'
-echo 'Running rke2-killall.sh...'
-timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo 'WARN: rke2-killall.sh returned non-zero'
+export PATH=\"\$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin\"
+echo '  Running: systemctl stop rke2-server  (timeout: ${STOP_TIMEOUT_SECS}s)'
+if timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-server 2>&1; then
+  echo '[PASS]  rke2-server stopped'
+else
+  echo '[WARN]  rke2-server stop returned non-zero — continuing to killall'
+fi
+echo '  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)'
+timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo '[WARN]  rke2-killall.sh returned non-zero'
+echo '[PASS]  rke2-killall.sh complete'
 residual=\$(ps aux 2>/dev/null | grep -E 'containerd|kubelet|rke2' | grep -v grep | grep -v patch-orchestrate || true)
 if [[ -n \"\${residual}\" ]]; then
-  echo 'WARN: residual processes remain:'
-  echo \"\${residual}\"
+  echo '[WARN]  Residual processes remain on \$(hostname):'
+  echo \"\${residual}\" | sed 's/^/    /'
 else
-  echo 'No residual processes.'
+  echo '[PASS]  No residual rke2/containerd/kubelet processes on \$(hostname)'
 fi
-echo 'SERVER_STOPPED'
 " || warn "  SSH stop command returned non-zero for ${node}"
 
   state_log "SERVER_STOPPED  ${node}  (orchestrated)"
-  pass "  Server node stopped: ${node}"
+  pass "  Server node ${node}: stopped"
 }
 
 # =============================================================================
