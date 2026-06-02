@@ -77,6 +77,7 @@ ETCD_EXEC_MODE=""
 ETCD_CONTAINER_ID=""
 
 UIPATHCTL_BIN=""
+INSTALLER_DIR=""   # set by --installer-dir flag or UIPATH_INSTALLER_DIR env
 
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 readonly MARKER_DIR="/opt/UiPathAutomationSuite"
@@ -170,55 +171,55 @@ etcdctl_cmd() {
 }
 
 resolve_uipathctl() {
+  # 1. uipathctl already on PATH
   if command -v uipathctl &>/dev/null; then
     UIPATHCTL_BIN="$(command -v uipathctl)"
     return 0
   fi
 
-  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
-    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+  # 2. --installer-dir flag or UIPATH_INSTALLER_DIR env var.
+  #    Both accept the UiPath version folder (e.g. /opt/UiPathAutomationSuite/2024.10.4).
+  #    Binary lives at <version-folder>/installer/bin/uipathctl.
+  local inst_dir="${INSTALLER_DIR:-${UIPATH_INSTALLER_DIR:-}}"
+  if [[ -n "${inst_dir}" ]]; then
+    inst_dir="${inst_dir%/}"    # strip trailing slash
+    local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
       export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
       return 0
     else
-      warn "UIPATH_INSTALLER_DIR='${UIPATH_INSTALLER_DIR}' set but ${candidate} not found/executable"
+      warn "--installer-dir='${inst_dir}': ${candidate} not found or not executable"
     fi
   fi
 
-  local known_paths=(
-    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
-    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
-  )
-  local p
-  for p in "${known_paths[@]}"; do
-    if [[ -x "${p}" ]]; then
-      UIPATHCTL_BIN="${p}"
-      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
-      return 0
-    fi
-  done
-
-  local found
-  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null \
-    | head -1)
-  if [[ -n "${found}" && -x "${found}" ]]; then
-    UIPATHCTL_BIN="${found}"
+  # 3. Fixed well-known path via 'latest' symlink
+  local fixed="/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  if [[ -x "${fixed}" ]]; then
+    UIPATHCTL_BIN="${fixed}"
     export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
     return 0
   fi
 
+  # Not found — caller handles the failure
   return 1
 }
 
 usage() {
   echo ""
-  echo "Usage: $0 [--global | --stop-agent | --stop-server | --identify-leader]"
+  echo "Usage: $0 [--global | --stop-agent | --stop-server | --identify-leader] [options]"
   echo ""
   echo "  --global            Enable maintenance mode + cordon all nodes (primary server)"
   echo "  --stop-agent        Drain and stop this agent node (run locally on agent)"
   echo "  --stop-server       Drain and stop this server node (run locally on server, leader last)"
   echo "  --identify-leader   Print current etcd leader (any server node)"
+  echo ""
+  echo "Options:"
+  echo "  --installer-dir=<path>   UiPath version folder containing installer/bin/uipathctl"
+  echo "                           Example: --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
+  echo "  --verbose / --debug      Full output including INFO lines and command output"
+  echo ""
+  echo "  Alternatively: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/2024.10.4 $0 --global"
   echo ""
   echo "Ref: Plan v1.1 — Phases A, C, D"
   echo ""
@@ -305,7 +306,7 @@ mode_global() {
   fi
 
   if ! resolve_uipathctl; then
-    fail "--global: uipathctl not found — set UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer"
+    fail "--global: uipathctl not found — pass --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
   fi
   info "uipathctl: ${UIPATHCTL_BIN}"
 
@@ -315,8 +316,7 @@ mode_global() {
   echo ""
 
   local mm_raw
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
     # Idempotent: Phase A already completed (e.g. previous run failed in Phase C).
@@ -324,24 +324,33 @@ mode_global() {
     pass "Phase A: Maintenance mode already enabled — skipping re-enable, proceeding to Phase C"
     state_log "MAINTENANCE_ALREADY_ENABLED  $(hostname)  (skip re-enable)"
   else
-    info "Enabling maintenance mode (namespace: ${UIPATH_NS}, timeout: ${MAINTENANCE_TIMEOUT})..."
-    info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --namespace ${UIPATH_NS} --timeout ${MAINTENANCE_TIMEOUT} --force"
+    info "Enabling maintenance mode (timeout: ${MAINTENANCE_TIMEOUT})..."
+    info "Command: ${UIPATHCTL_BIN} cluster maintenance enable --timeout ${MAINTENANCE_TIMEOUT} --force"
     echo ""
 
-    # Suppress logrus INFO[xxxx] and k8s W0601... warnings (stderr); keep stdout ("Successfully enabled...")
-    local enable_stderr="/dev/null"
-    [[ "${VERBOSE}" == "true" ]] && enable_stderr="/dev/stderr"
+    # Capture both stdout and stderr so we can show the actual error on failure.
+    # uipathctl writes all output (structured + logrus) to stderr; stdout may be empty.
+    local enable_out enable_exit=0
+    enable_out=$("${UIPATHCTL_BIN}" cluster maintenance enable \
+      --timeout "${MAINTENANCE_TIMEOUT}" \
+      --force 2>&1) || enable_exit=$?
 
-    if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
-         --namespace "${UIPATH_NS}" \
-         --timeout "${MAINTENANCE_TIMEOUT}" \
-         --force 2>"${enable_stderr}"; then
-      fail "Phase A: uipathctl cluster maintenance enable failed or timed out"
+    # Strip logrus noise for display; always show on failure
+    local enable_clean
+    enable_clean=$(echo "${enable_out}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' || true)
+
+    if [[ "${enable_exit}" -ne 0 ]]; then
+      log "${RED}[FAIL]${RESET}  Phase A: uipathctl cluster maintenance enable failed"
+      log "${RED}[FAIL]${RESET}  Output from uipathctl:"
+      echo "${enable_clean}" | sed 's/^/    /'
+      echo ""
+      fail "Phase A: uipathctl cluster maintenance enable failed — see output above"
     fi
 
+    [[ "${VERBOSE}" == "true" && -n "${enable_clean}" ]] && echo "${enable_clean}" | sed 's/^/  /'
+
     # Verify maintenance mode took effect
-    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-      --namespace "${UIPATH_NS}" 2>/dev/null || true)
+    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
     if ! maintenance_is_enabled "${mm_raw}"; then
       fail "Phase A: Maintenance mode not confirmed enabled after enable command (is-enabled returned: '${mm_raw}')"
@@ -715,12 +724,12 @@ POST-PATCH CHECKLIST (run from primary server after all nodes are Ready):
                                      --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \
                                      --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key \
                                      endpoint health --cluster
-  3. Disable maintenance mode:     uipathctl cluster maintenance disable --namespace uipath
+  3. Disable maintenance mode:     uipathctl cluster maintenance disable
   4. Remove nodejanitor label:     kubectl label node <each-node> nodejanitor/skip-
      (do this BEFORE uncordoning — so nodejanitor does not re-cordon on uncordon)
   5. Uncordon all nodes:           kubectl uncordon <each-node>
   6. Run preflight again:          ./01-preflight.sh
-  7. Run product health check:     uipathctl health check --namespace uipath
+  7. Run product health check:     uipathctl health check
 MARKEREOF
     state_log "PREPATCH_COMPLETE  $(hostname)  leader=${leader_host}  marker=${marker}"
 
@@ -761,6 +770,7 @@ main() {
   for arg in "$@"; do
     case "${arg}" in
       --verbose|--debug|-v) VERBOSE=true ;;
+      --installer-dir=*) INSTALLER_DIR="${arg#--installer-dir=}" ;;
       --global|--stop-agent|--stop-server|--identify-leader) mode="${arg}" ;;
       --help|-h) usage; exit 0 ;;
       *) echo -e "${RED}Unknown argument: ${arg}${RESET}"; usage; exit 1 ;;
