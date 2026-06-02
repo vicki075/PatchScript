@@ -139,12 +139,31 @@ resolve_uipathctl() {
 
 # =============================================================================
 # GUARD: must run on a server node
+# Detection is based on server config/data presence — NOT service state.
+# rke2-server may be 'activating' (waiting for etcd leader after another node
+# stopped) or 'inactive' (stopped by a prior prepatch run). Snapshots are
+# static files; the service does not need to be running to copy them.
 # =============================================================================
 guard_server_node() {
-  if ! systemctl is-active --quiet rke2-server 2>/dev/null; then
-    fail "This script must run on a SERVER node (rke2-server.service active). Detected: agent or uninitialized node on $(hostname)."
+  local is_server=false
+  if [[ -f "/etc/rancher/rke2/rke2.yaml" ]] || \
+     [[ -d "/var/lib/rancher/rke2/server/db/snapshots" ]] || \
+     [[ -d "/var/lib/rancher/rke2/server/tls" ]]; then
+    is_server=true
   fi
-  info "Confirmed server node: $(hostname)"
+
+  if [[ "${is_server}" == "false" ]]; then
+    fail "This script must run on a SERVER node. No server config or snapshot directory found on $(hostname). Agent nodes do not have etcd snapshots to back up."
+  fi
+
+  # Report actual service state — informational only, does not gate the backup
+  local svc_state
+  svc_state=$(systemctl is-active rke2-server 2>/dev/null || echo "unknown")
+  info "Server node confirmed: $(hostname)  (rke2-server: ${svc_state})"
+
+  if [[ "${svc_state}" != "active" ]]; then
+    log "${YELLOW}[WARN]${RESET}  rke2-server is '${svc_state}' on $(hostname) — snapshot files are on disk and can be copied regardless of service state"
+  fi
 }
 
 # =============================================================================
@@ -321,7 +340,8 @@ verify_cluster_after_backup() {
     local not_ready
     not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
     if [[ -n "${not_ready}" ]]; then
-      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Following nodes not Ready (unexpected — investigate):"
+      local nr_count; nr_count=$(echo "${not_ready}" | wc -l | tr -d ' ')
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: ${nr_count} node(s) not Ready — expected if prior --stop-server runs have completed"
       if [[ "${VERBOSE}" == "true" ]]; then
         echo "${not_ready}" | sed 's/^/  /'
       fi
