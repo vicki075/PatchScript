@@ -562,9 +562,16 @@ phase_leader_info() {
 phase_drain() {
   echo -e "\n${BOLD}--- Phase 5: Drain ---${RESET}"
 
-  systemctl stop node-drain.service 2>/dev/null || true
+  # Step 1 (UiPath docs): stop node-drain.service to drain workloads off this node
+  log "  Running: systemctl stop node-drain.service"
+  if timeout 60 systemctl stop node-drain.service 2>/dev/null; then
+    pass "Phase 5: node-drain.service stopped"
+  else
+    warn "Phase 5: node-drain.service not running or not found — continuing"
+  fi
 
-  info "Running: kubectl drain ${MY_NODE} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
+  # Step 1b: Kubernetes-level pod eviction for any remaining pods
+  log "  Running: kubectl drain ${MY_NODE} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
   if ! kubectl drain "${MY_NODE}" \
        --ignore-daemonsets \
        --delete-emptydir-data \
@@ -703,24 +710,27 @@ for p in pending:
 phase_stop_rke2() {
   echo -e "\n${BOLD}--- Phase 9: Stop RKE2 ---${RESET}"
 
+  # Step 2 (UiPath docs): stop the Kubernetes process on this node
   if [[ "${IS_SERVER}" == "true" ]]; then
-    info "Stopping rke2-server (timeout: ${STOP_TIMEOUT_SECS}s)..."
+    log "  Running: systemctl stop rke2-server  (timeout: ${STOP_TIMEOUT_SECS}s)"
     if ! timeout "${STOP_TIMEOUT_SECS}" systemctl stop rke2-server 2>&1; then
-      warn "Phase 9: rke2-server did not stop within ${STOP_TIMEOUT_SECS}s — continuing"
+      warn "Phase 9: rke2-server did not stop within ${STOP_TIMEOUT_SECS}s — continuing to killall"
     else
       pass "Phase 9: rke2-server stopped"
     fi
   else
-    info "Stopping rke2-agent (timeout: ${STOP_TIMEOUT_SECS}s)..."
+    log "  Running: systemctl stop rke2-agent  (timeout: ${STOP_TIMEOUT_SECS}s)"
     if ! timeout "${STOP_TIMEOUT_SECS}" systemctl stop rke2-agent 2>&1; then
-      warn "Phase 9: rke2-agent did not stop within ${STOP_TIMEOUT_SECS}s — continuing"
+      warn "Phase 9: rke2-agent did not stop within ${STOP_TIMEOUT_SECS}s — continuing to killall"
     else
       pass "Phase 9: rke2-agent stopped"
     fi
   fi
 
-  info "Running rke2-killall.sh (timeout: ${KILLALL_TIMEOUT_SECS}s)..."
+  # Step 3 (UiPath docs): terminate rke2, containerd, and all child processes
+  log "  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)"
   timeout "${KILLALL_TIMEOUT_SECS}" rke2-killall.sh 2>&1 || warn "Phase 9: rke2-killall.sh returned non-zero"
+  pass "Phase 9: rke2-killall.sh complete"
 
   # Verify no residuals
   local residual
