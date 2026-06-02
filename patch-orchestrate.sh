@@ -109,7 +109,8 @@ usage() {
   echo "  --installer-dir=<path>   UiPath version folder; required unless uipathctl is in PATH"
   echo "  --ssh-user=<user>        SSH user (default: root)"
   echo "  --ssh-port=<port>        SSH port (default: 22)"
-  echo "  --skip-hc=comp1,comp2   Health check component names to skip on failure"
+  echo "  --skip-hc=all           Skip health check failures entirely"
+  echo "  --skip-hc=comp1,comp2   Skip specific failing components by name"
   echo "  --servers=a,b,c          Server node hostnames (auto-discovered if omitted)"
   echo "  --agents=a,b             Agent node hostnames (auto-discovered if omitted)"
   echo "  --help                   Show this help"
@@ -371,13 +372,22 @@ run_health_check() {
   done <<< "${cleaned}"
 
   if [[ ${#failed_components[@]} -eq 0 ]]; then
-    abort "Health check command failed — check binary version/path"
+    abort "Health check command failed — check binary version/path (use --installer-dir)"
   fi
 
+  # --skip-hc=all  →  ignore every failure
+  for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
+    if [[ "${skip_comp,,}" == "all" ]]; then
+      warn "Health check had failures — skipped (--skip-hc=all): ${failed_components[*]}"
+      return 0
+    fi
+  done
+
+  # Check each failed component against the explicit skip list
   local unresolved=()
   for comp in "${failed_components[@]}"; do
     local skip=false
-    for skip_comp in "${SKIP_HC_COMPONENTS[@]}"; do
+    for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
       if [[ "${comp,,}" == "${skip_comp,,}" ]]; then
         skip=true
         break
@@ -389,10 +399,10 @@ run_health_check() {
   if [[ ${#unresolved[@]} -gt 0 ]]; then
     local unresolved_str
     unresolved_str=$(IFS=','; echo "${unresolved[*]}")
-    abort "Health check failed — unresolved components: ${unresolved_str}. Add to --skip-hc if safe to proceed."
+    abort "Health check failed — unresolved: ${unresolved_str}. Use --skip-hc=all to bypass or --skip-hc=comp1,comp2 for specific ones."
   fi
 
-  warn "Health check had failures but all failed components are in --skip-hc: ${failed_components[*]} — continuing"
+  warn "Health check had failures but all in --skip-hc list: ${failed_components[*]} — continuing"
 }
 
 # =============================================================================
