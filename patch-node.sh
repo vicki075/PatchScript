@@ -417,21 +417,28 @@ phase_maintenance_mode() {
   echo -e "\n${BOLD}--- Phase 2: Enable Maintenance Mode ---${RESET}"
 
   local mm_raw
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
     pass "Phase 2: Maintenance mode already enabled — skipping"
     return 0
   fi
 
-  info "Enabling maintenance mode..."
-  if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
-       --namespace "${UIPATH_NS}" 2>/dev/null; then
-    abort "Phase 2: uipathctl cluster maintenance enable failed"
+  log "  Enabling maintenance mode..."
+  local enable_out enable_exit=0
+  enable_out=$("${UIPATHCTL_BIN}" cluster maintenance enable \
+    --timeout 30m --force 2>&1) || enable_exit=$?
+
+  if [[ "${enable_exit}" -ne 0 ]]; then
+    local enable_clean
+    enable_clean=$(echo "${enable_out}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' || true)
+    log "${RED}[FAIL]${RESET}  uipathctl cluster maintenance enable failed:"
+    echo "${enable_clean}" | sed 's/^/    /'
+    abort "Phase 2: maintenance enable failed — see output above"
   fi
 
   # Wait up to 3 min for UiPath pods to scale to 0
+  log "  Waiting for UiPath pods to scale down (up to 3 min)..."
   local deadline=$(( $(date +%s) + 180 ))
   local running_count
   while [[ $(date +%s) -lt ${deadline} ]]; do
@@ -442,7 +449,7 @@ phase_maintenance_mode() {
     if [[ "${running_count}" -eq 0 ]]; then
       break
     fi
-    info "  Waiting for UiPath pods to scale down... (${running_count} Running)"
+    log "  ${running_count} pod(s) still Running — waiting..."
     sleep 15
   done
 
@@ -483,9 +490,19 @@ phase_leader_info() {
   echo -e "\n${BOLD}--- Phase 4: Leader Info ---${RESET}"
 
   if [[ "${IS_LEADER}" == "true" ]]; then
-    warn "THIS NODE (${MY_NODE}) IS THE ETCD LEADER — it will STOP LAST and should be REBOOTED FIRST"
+    log "${YELLOW}${BOLD}  ★ THIS NODE (${MY_NODE}) IS THE ETCD LEADER${RESET}"
+    log "${YELLOW}${BOLD}    → Stop this node LAST among servers${RESET}"
+    log "${YELLOW}${BOLD}    → Reboot this node FIRST after OS patch${RESET}"
   else
-    info "etcd leader: ${LEADER_NODE:-unknown} (stop last, reboot first)"
+    if [[ -n "${LEADER_NODE}" ]]; then
+      log "${CYAN}[INFO]${RESET}  etcd leader: ${BOLD}${LEADER_NODE}${RESET}"
+      log "${CYAN}[INFO]${RESET}  This node (${MY_NODE}) is a non-leader — stops before the leader"
+      log "${CYAN}[INFO]${RESET}  Stop order:  agents → non-leaders → ${LEADER_NODE} LAST"
+      log "${CYAN}[INFO]${RESET}  Reboot order: ${LEADER_NODE} FIRST → other servers → agents"
+    else
+      log "${YELLOW}[WARN]${RESET}  Could not detect etcd leader (etcdctl unavailable or not a server node)"
+      log "${YELLOW}[WARN]${RESET}  Identify leader manually before sequencing server stops"
+    fi
   fi
 }
 
