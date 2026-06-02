@@ -6,9 +6,9 @@
 #           pages/90751108300/Cluster+nodes+Pre-Patch+Tasks  (v1.1)
 #
 # Execution model:
-#   Run on the PRIMARY SERVER NODE for full coverage (all 9 checks).
-#   Run on EVERY NODE for local checks only (PF-05, PF-06, PF-09).
-#   Script auto-detects role based on kubectl + KUBECONFIG availability.
+#   Run ONCE on the PRIMARY SERVER NODE before any patching begins.
+#   All 9 checks run against the live cluster. Do NOT re-run mid-patch
+#   (nodes will be cordoned/stopped; cluster state is intentionally degraded).
 #
 # Error handling:
 #   ALL applicable checks run regardless of individual failures.
@@ -36,13 +36,15 @@
 #   1. Host binary: /var/lib/rancher/rke2/bin/etcdctl
 #   2. Container exec via crictl (clusters where etcdctl lives inside the etcd container)
 #
-# uipathctl resolution (auto-detected, in priority order):
+# uipathctl resolution (in priority order):
 #   1. PATH
-#   2. UIPATH_INSTALLER_DIR env var:  <dir>/bin/uipathctl
-#   3. /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl
-#   4. find /opt/UiPathAutomationSuite -name uipathctl (capped depth)
+#   2. --installer-dir flag or UIPATH_INSTALLER_DIR env var:
+#        <dir>/installer/bin/uipathctl
+#        (pass the UiPath version folder, e.g. /opt/UiPathAutomationSuite/2024.10.4)
+#   3. /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl  (fixed symlink)
 #
-#   Override: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh
+#   If auto-discovery fails:
+#     ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4
 #
 # Exit codes:
 #   0  — all checks passed (or passed with warnings only)
@@ -97,6 +99,7 @@ readonly CRI_CONFIG="/var/lib/rancher/rke2/agent/etc/crictl.yaml"
 ETCD_EXEC_MODE=""
 ETCD_CONTAINER_ID=""
 UIPATHCTL_BIN=""
+INSTALLER_DIR=""   # set by --installer-dir flag or UIPATH_INSTALLER_DIR env
 
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 
@@ -106,13 +109,6 @@ WARNED_CHECKS=()
 
 # Verbosity — default quiet; set by --verbose / --debug flag
 VERBOSE=false
-
-# Mid-patch mode — set with --mid-patch when running on subsequent nodes after Phase A+C+D
-# have already started. Relaxes PF-01/PF-02/PF-08 expectations:
-#   PF-01: nodes NotReady or cordoned → WARN (expected after prior --stop-server runs)
-#   PF-02: some etcd endpoints unhealthy → WARN if quorum maintained, FAIL if quorum lost
-#   PF-08: maintenance mode enabled → PASS (expected — Phase A was done)
-MID_PATCH=false
 
 # =============================================================================
 # HELPERS
@@ -225,44 +221,37 @@ etcdctl_cmd() {
 # UIPATHCTL RESOLUTION
 # =============================================================================
 resolve_uipathctl() {
+  # 1. uipathctl already on PATH
   if command -v uipathctl &>/dev/null; then
     UIPATHCTL_BIN="$(command -v uipathctl)"
     return 0
   fi
 
-  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
-    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+  # 2. --installer-dir flag or UIPATH_INSTALLER_DIR env var.
+  #    Both accept the UiPath version folder (e.g. /opt/UiPathAutomationSuite/2024.10.4).
+  #    Binary lives at <version-folder>/installer/bin/uipathctl.
+  local inst_dir="${INSTALLER_DIR:-${UIPATH_INSTALLER_DIR:-}}"
+  if [[ -n "${inst_dir}" ]]; then
+    inst_dir="${inst_dir%/}"    # strip trailing slash
+    local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
       export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
       return 0
     else
-      warn "UIPATH_INSTALLER_DIR='${UIPATH_INSTALLER_DIR}' set but ${candidate} not found/executable"
+      warn "--installer-dir='${inst_dir}': ${candidate} not found or not executable"
     fi
   fi
 
-  local known_paths=(
-    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
-    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
-  )
-  local p
-  for p in "${known_paths[@]}"; do
-    if [[ -x "${p}" ]]; then
-      UIPATHCTL_BIN="${p}"
-      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
-      return 0
-    fi
-  done
-
-  local found
-  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null \
-    | head -1)
-  if [[ -n "${found}" && -x "${found}" ]]; then
-    UIPATHCTL_BIN="${found}"
+  # 3. Fixed well-known path via 'latest' symlink
+  local fixed="/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  if [[ -x "${fixed}" ]]; then
+    UIPATHCTL_BIN="${fixed}"
     export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
     return 0
   fi
 
+  # Not found — caller handles the failure
   return 1
 }
 
@@ -327,10 +316,7 @@ discover_topology() {
 
 # =============================================================================
 # PF-01 — All nodes Ready; none pre-cordoned
-# Severity:
-#   Normal    — FAIL if any node NotReady or cordoned (unexpected stale state)
-#   Mid-patch — WARN if nodes NotReady (prior --stop-server runs expected);
-#               PASS if nodes cordoned (Phase C did this intentionally)
+# Severity: FAIL — unexpected stale state means the cluster was not clean before patching started.
 # =============================================================================
 pf01_node_readiness() {
   info "PF-01: Checking node readiness and cordon state..."
@@ -339,14 +325,9 @@ pf01_node_readiness() {
   local not_ready
   not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
   if [[ -n "${not_ready}" ]]; then
-    local nr_count; nr_count=$(echo "${not_ready}" | wc -l | tr -d ' ')
     echo "  Not-Ready nodes:"; echo "${not_ready}" | sed 's/^/    /'
-    if [[ "${MID_PATCH}" == "true" ]]; then
-      check_warn "PF-01" "${nr_count} node(s) not Ready — expected mid-patch (prior --stop-server runs)"
-    else
-      check_fail "PF-01" "One or more nodes are not Ready"
-      pf01_ok=false
-    fi
+    check_fail "PF-01" "One or more nodes are not Ready"
+    pf01_ok=false
   fi
 
   local cordoned
@@ -356,23 +337,13 @@ nodes=json.load(sys.stdin)['items']
 print('\n'.join(n['metadata']['name'] for n in nodes if n.get('spec',{}).get('unschedulable')))
 " 2>/dev/null || true)
   if [[ -n "${cordoned}" ]]; then
-    if [[ "${MID_PATCH}" == "true" ]]; then
-      local cord_count; cord_count=$(echo "${cordoned}" | wc -l | tr -d ' ')
-      info "PF-01: ${cord_count} node(s) cordoned — expected mid-patch (Phase C applied)"
-    else
-      echo "  Pre-cordoned nodes:"; echo "${cordoned}" | sed 's/^/    /'
-      check_fail "PF-01" "Nodes already SchedulingDisabled — investigate before proceeding"
-      pf01_ok=false
-    fi
+    echo "  Pre-cordoned nodes:"; echo "${cordoned}" | sed 's/^/    /'
+    check_fail "PF-01" "Nodes already SchedulingDisabled — investigate before proceeding"
+    pf01_ok=false
   fi
 
-  if [[ "${pf01_ok}" == "true" ]]; then
-    if [[ "${MID_PATCH}" == "true" ]]; then
-      pass "PF-01: Node state acceptable for mid-patch run"
-    else
-      pass "PF-01: All ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned"
-    fi
-  fi
+  [[ "${pf01_ok}" == "true" ]] && \
+    pass "PF-01: All ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned"
 }
 
 # =============================================================================
@@ -631,33 +602,37 @@ pf07_uipath_health() {
 
   if [[ -z "${UIPATHCTL_BIN}" ]]; then
     check_fail "PF-07" \
-      "uipathctl not found — required for maintenance mode (Phase A). Set UIPATH_INSTALLER_DIR. Example: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh"
+      "uipathctl not found — required for maintenance mode (Phase 2). Pass --installer-dir. Example: ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
     return
   fi
 
   info "PF-07: Using ${UIPATHCTL_BIN}"
 
-  # uipathctl prefixes ALL lines with logrus tags (INFO[XXXX] / WARN[XXXX] etc.)
-  # and writes everything to stderr. Capture stderr+stdout together (2>&1),
-  # then:
-  #   1. Strip the logrus prefix (INFO[0009] ) from every line
-  #   2. Keep only structured health check lines — those containing
-  #      "Ran ", ✔, ❌, "successful", or "check" (filters out noisy lines like
-  #      "application X has sync enabled", "Pod X is healthy", etc.)
+  # uipathctl health check writes all output (structured + logrus noise) to stderr.
+  # Capture stderr+stdout together (2>&1), then strip pure logrus lines
+  # (^INFO[0009] / ^WARN[0009] / ^ERRO[0009] / ^DEBU[0009]).
+  # Structured health check lines have no logrus prefix — they pass through unchanged.
   local hc_output hc_exit=0
-  hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
+  hc_output=$("${UIPATHCTL_BIN}" health check --timeout 10m \
     2>&1) || hc_exit=$?
 
-  # Strip only pure logrus noise lines (INFO[0009] / WARN[0009] etc.)
-  # Everything else — Checks run / ✔ / ❌ / Error lines — passes through unchanged.
+  # Strip only pure logrus noise lines; preserve everything else.
   local clean_output
   clean_output=$(echo "${hc_output}" \
     | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' \
     || true)
 
   if [[ "${hc_exit}" -ne 0 ]]; then
-    check_warn "PF-07" \
-      "uipathctl health check reported failures (pre-existing app issue — does not block OS patching)"
+    # Distinguish: command-level error (bad flag, wrong binary) vs health check failures.
+    # Command errors start with "Error:" and produce no structured output.
+    if echo "${clean_output}" | grep -qE '^Error:'; then
+      check_warn "PF-07" \
+        "uipathctl health check did not complete — binary/command error (verify --installer-dir points to the correct version)"
+      log "${YELLOW}[WARN]${RESET}          Error output from uipathctl:"
+    else
+      check_warn "PF-07" \
+        "uipathctl health check reported failures (pre-existing app issue — does not block OS patching)"
+    fi
     echo "${clean_output}" | sed 's/^/  /'
     return
   fi
@@ -683,8 +658,7 @@ pf08_no_active_operation() {
     # is-enabled may return "true"/"false" or a descriptive string like
     # "Maintenance mode is enabled" — check both forms; negatives take priority
     local mm_raw mm_on=false
-    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-      --namespace "${UIPATH_NS}" 2>/dev/null || true)
+    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
     if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
       echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
     fi
@@ -841,10 +815,17 @@ main() {
   for arg in "$@"; do
     case "${arg}" in
       --verbose|--debug|-v) VERBOSE=true ;;
+      --installer-dir=*)
+        INSTALLER_DIR="${arg#--installer-dir=}"
+        ;;
       --help|-h)
-        echo "Usage: $0 [--verbose|--debug]"
-        echo "  Default: only PASS/WARN/FAIL lines + summary"
-        echo "  --verbose / --debug: full output including INFO and command output"
+        echo "Usage: $0 [--verbose] [--installer-dir=<path>]"
+        echo ""
+        echo "  --installer-dir=<path>   UiPath version folder containing installer/bin/uipathctl"
+        echo "                           Example: --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
+        echo "  --verbose / --debug      Full output including INFO lines and command output"
+        echo ""
+        echo "  Alternatively: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/2024.10.4 ./01-preflight.sh"
         exit 0 ;;
     esac
   done
@@ -852,7 +833,8 @@ main() {
   echo -e "\n${BOLD}================================================================${RESET}"
   echo -e "${BOLD}  UiPath AS 24.10.4 / RKE2 — Pre-Patch Pre-Flight Checks${RESET}"
   echo -e "${BOLD}  Node: $(hostname)   |   $(ts)${RESET}"
-  [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
+  [[ "${VERBOSE}"      == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
+  [[ -n "${INSTALLER_DIR}" ]]     && echo -e "${CYAN}  --installer-dir: ${INSTALLER_DIR}${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
 
   local is_server=false has_kubectl=false
@@ -877,9 +859,9 @@ main() {
     if resolve_uipathctl; then
       info "uipathctl resolved: ${UIPATHCTL_BIN}"
     else
-      warn "uipathctl not found in PATH or common locations"
-      warn "Set UIPATH_INSTALLER_DIR to the installer directory and re-run"
-      warn "  Example: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh"
+      warn "uipathctl not found in PATH or at /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+      warn "Pass --installer-dir with the UiPath version folder and re-run"
+      warn "  Example: ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
     fi
     echo ""
 
