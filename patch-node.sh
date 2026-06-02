@@ -66,6 +66,7 @@ MY_NODE=""
 IS_SERVER=false
 IS_LEADER=false
 LEADER_NODE=""
+KUBECTL_AVAILABLE=false
 
 # =============================================================================
 # HELPERS
@@ -186,22 +187,28 @@ detect_role() {
 detect_my_node() {
   local short_host
   short_host=$(hostname -s)
-  # Match against node names from kubectl — node name may be FQDN or short
-  MY_NODE=$(kubectl get nodes --no-headers \
-    -o custom-columns='NAME:.metadata.name' 2>/dev/null \
-    | grep -F "${short_host}" | head -1 || true)
 
-  if [[ -z "${MY_NODE}" ]]; then
-    # Fallback: exact match on hostname
+  if [[ "${KUBECTL_AVAILABLE}" == "true" ]]; then
     MY_NODE=$(kubectl get nodes --no-headers \
       -o custom-columns='NAME:.metadata.name' 2>/dev/null \
-      | awk -v h="${short_host}" '$1 == h' | head -1 || true)
+      | grep -F "${short_host}" | head -1 || true)
+
+    if [[ -z "${MY_NODE}" ]]; then
+      MY_NODE=$(kubectl get nodes --no-headers \
+        -o custom-columns='NAME:.metadata.name' 2>/dev/null \
+        | awk -v h="${short_host}" '$1 == h' | head -1 || true)
+    fi
   fi
 
+  # kubectl unavailable or node not found — fall back to local hostname.
+  # Expected on the last server node when the other 2 are already stopped
+  # (etcd quorum lost → API server unreachable).
   if [[ -z "${MY_NODE}" ]]; then
-    abort "Could not resolve node name for hostname '${short_host}' in kubectl node list"
+    MY_NODE="${short_host}"
+    info "Node name resolved from hostname (kubectl unavailable): ${MY_NODE}"
+  else
+    info "My node name: ${MY_NODE}"
   fi
-  info "My node name: ${MY_NODE}"
 }
 
 detect_leader() {
@@ -729,39 +736,60 @@ main() {
   echo -e "${BOLD}  Node: $(hostname -s)   |   $(ts)${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
 
+  # Check kubectl availability once — used to gate cluster-dependent phases
+  if command -v kubectl &>/dev/null && kubectl get nodes &>/dev/null 2>&1; then
+    KUBECTL_AVAILABLE=true
+  else
+    KUBECTL_AVAILABLE=false
+  fi
+
   # Detect role and node name
   detect_role
   detect_my_node
   detect_leader
 
-  # Idempotency: if already stopped, exit cleanly
-  local current_phase
-  current_phase=$(kubectl get node "${MY_NODE}" \
-    -o jsonpath='{.metadata.annotations.prepatch\.uipath\.io/phase}' \
-    2>/dev/null || true)
+  if [[ "${KUBECTL_AVAILABLE}" == "false" ]]; then
+    # ── DEGRADED MODE ──────────────────────────────────────────────────────
+    # kubectl API is unreachable — expected on the LAST server node when the
+    # other servers are already stopped (etcd quorum lost).
+    # Skip all kubectl-dependent phases; run backup + stop only.
+    log "${YELLOW}[WARN]${RESET}  kubectl API unreachable — etcd quorum likely lost (other servers already stopped)"
+    log "${YELLOW}[WARN]${RESET}  Skipping: health check, maintenance, cordon, drain, leader wait"
+    log "${YELLOW}[WARN]${RESET}  Running: backup (if server) + rke2 stop"
+    echo ""
+    phase_leader_info
+    phase_backup
+    phase_stop_rke2
+  else
+    # ── NORMAL MODE ────────────────────────────────────────────────────────
+    # Idempotency: if already stopped, exit cleanly
+    local current_phase
+    current_phase=$(kubectl get node "${MY_NODE}" \
+      -o jsonpath='{.metadata.annotations.prepatch\.uipath\.io/phase}' \
+      2>/dev/null || true)
 
-  if [[ "${current_phase}" == "stopped" ]]; then
-    pass "Node ${MY_NODE} already has phase=stopped — nothing to do"
-    exit 0
+    if [[ "${current_phase}" == "stopped" ]]; then
+      pass "Node ${MY_NODE} already has phase=stopped — nothing to do"
+      exit 0
+    fi
+
+    info "Current phase annotation: ${current_phase:-<none>}"
+
+    # Resolve uipathctl
+    if ! resolve_uipathctl; then
+      abort "uipathctl not found — set --installer-dir=<path> or ensure uipathctl is in PATH"
+    fi
+
+    phase_health_check
+    phase_maintenance_mode
+    phase_cordon
+    phase_leader_info
+    phase_drain
+    phase_backup
+    phase_signal_ready
+    phase_leader_wait
+    phase_stop_rke2
   fi
-
-  info "Current phase annotation: ${current_phase:-<none>}"
-
-  # Resolve uipathctl
-  if ! resolve_uipathctl; then
-    abort "uipathctl not found — set --installer-dir=<path> or ensure uipathctl is in PATH"
-  fi
-
-  # Execute phases
-  phase_health_check
-  phase_maintenance_mode
-  phase_cordon
-  phase_leader_info
-  phase_drain
-  phase_backup
-  phase_signal_ready
-  phase_leader_wait
-  phase_stop_rke2
 
   # Final banner
   echo ""
