@@ -24,9 +24,10 @@
 #
 #   What causes FAIL vs WARN:
 #     FAIL: node not Ready, etcd unhealthy, API server down, critical disk (<rancher/<kubelet),
-#           maintenance mode already set, uipathctl not found (needed for maintenance mode)
+#           maintenance mode already set, uipathctl not found (needed for maintenance mode),
+#           RKE2 package exclusion missing (yum upgrade would silently upgrade rke2 binaries)
 #     WARN: pod CrashLoop/stuck Terminating (pre-existing app issues), /var or /opt low disk,
-#           RKE2 package pin missing, UiPath health check failures, stale/missing etcd snapshots
+#           UiPath health check failures, stale/missing etcd snapshots
 #
 #   Exception: truly fatal infra errors (kubectl unavailable, topology broken)
 #   still abort immediately — subsequent checks would be meaningless.
@@ -105,6 +106,13 @@ WARNED_CHECKS=()
 
 # Verbosity — default quiet; set by --verbose / --debug flag
 VERBOSE=false
+
+# Mid-patch mode — set with --mid-patch when running on subsequent nodes after Phase A+C+D
+# have already started. Relaxes PF-01/PF-02/PF-08 expectations:
+#   PF-01: nodes NotReady or cordoned → WARN (expected after prior --stop-server runs)
+#   PF-02: some etcd endpoints unhealthy → WARN if quorum maintained, FAIL if quorum lost
+#   PF-08: maintenance mode enabled → PASS (expected — Phase A was done)
+MID_PATCH=false
 
 # =============================================================================
 # HELPERS
@@ -319,18 +327,26 @@ discover_topology() {
 
 # =============================================================================
 # PF-01 — All nodes Ready; none pre-cordoned
-# Severity: FAIL — node state directly affects drain/stop sequencing
+# Severity:
+#   Normal    — FAIL if any node NotReady or cordoned (unexpected stale state)
+#   Mid-patch — WARN if nodes NotReady (prior --stop-server runs expected);
+#               PASS if nodes cordoned (Phase C did this intentionally)
 # =============================================================================
 pf01_node_readiness() {
-  info "PF-01: Checking all ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned..."
+  info "PF-01: Checking node readiness and cordon state..."
   local pf01_ok=true
 
   local not_ready
   not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
   if [[ -n "${not_ready}" ]]; then
+    local nr_count; nr_count=$(echo "${not_ready}" | wc -l | tr -d ' ')
     echo "  Not-Ready nodes:"; echo "${not_ready}" | sed 's/^/    /'
-    check_fail "PF-01" "One or more nodes are not Ready"
-    pf01_ok=false
+    if [[ "${MID_PATCH}" == "true" ]]; then
+      check_warn "PF-01" "${nr_count} node(s) not Ready — expected mid-patch (prior --stop-server runs)"
+    else
+      check_fail "PF-01" "One or more nodes are not Ready"
+      pf01_ok=false
+    fi
   fi
 
   local cordoned
@@ -340,13 +356,23 @@ nodes=json.load(sys.stdin)['items']
 print('\n'.join(n['metadata']['name'] for n in nodes if n.get('spec',{}).get('unschedulable')))
 " 2>/dev/null || true)
   if [[ -n "${cordoned}" ]]; then
-    echo "  Pre-cordoned nodes:"; echo "${cordoned}" | sed 's/^/    /'
-    check_fail "PF-01" "Nodes already SchedulingDisabled — investigate before proceeding"
-    pf01_ok=false
+    if [[ "${MID_PATCH}" == "true" ]]; then
+      local cord_count; cord_count=$(echo "${cordoned}" | wc -l | tr -d ' ')
+      info "PF-01: ${cord_count} node(s) cordoned — expected mid-patch (Phase C applied)"
+    else
+      echo "  Pre-cordoned nodes:"; echo "${cordoned}" | sed 's/^/    /'
+      check_fail "PF-01" "Nodes already SchedulingDisabled — investigate before proceeding"
+      pf01_ok=false
+    fi
   fi
 
-  [[ "${pf01_ok}" == "true" ]] && \
-    pass "PF-01: All ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned"
+  if [[ "${pf01_ok}" == "true" ]]; then
+    if [[ "${MID_PATCH}" == "true" ]]; then
+      pass "PF-01: Node state acceptable for mid-patch run"
+    else
+      pass "PF-01: All ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned"
+    fi
+  fi
 }
 
 # =============================================================================
@@ -568,17 +594,29 @@ pf05_disk_space() {
 
 # =============================================================================
 # PF-06 — RKE2 package pin (LOCAL NODE)
-# Severity: WARN — important advisory; OS patch tool may upgrade RKE2 if absent,
-#           but this does not prevent the patch window from starting.
+# Severity: FAIL — if rke2-* is not excluded, yum upgrade may silently upgrade
+#           RKE2 binaries to an untested version, breaking the AS cluster.
+#           Ref: UiPath AS docs — "rke2-* package upgrade will be handled via
+#           the Automation Suite upgrade" (not via OS patch).
+# Two remediation paths:
+#   Permanent : echo 'exclude=rke2-*' >> /etc/yum.conf
+#   Per-run   : yum upgrade --exclude "rke2-*"   (pass to patch orchestrator)
 # =============================================================================
 pf06_rke2_package_pin() {
-  info "PF-06: Checking RKE2 package pin on $(hostname)..."
+  info "PF-06: Checking RKE2 package exclusion on $(hostname)..."
 
-  if grep -qr 'exclude=rke2-\*' /etc/yum.conf /etc/yum.repos.d/ 2>/dev/null; then
-    pass "PF-06: RKE2 package pin (exclude=rke2-*) confirmed on $(hostname)"
+  # Match both 'exclude=rke2-*' and 'excludepkgs=rke2-*' (dnf style),
+  # with optional whitespace around '=' and before 'rke2'
+  if grep -Erq 'exclude(pkgs)?\s*=\s*rke2' /etc/yum.conf /etc/yum.repos.d/ /etc/dnf/dnf.conf 2>/dev/null; then
+    pass "PF-06: RKE2 package exclusion confirmed on $(hostname)"
   else
-    check_warn "PF-06" \
-      "RKE2 package pin missing on $(hostname) — OS patch may inadvertently upgrade RKE2 binaries. Add 'exclude=rke2-*' to yum config."
+    check_fail "PF-06" "RKE2 package exclusion missing on $(hostname)"
+    log "${RED}[FAIL]${RESET}          Upgrading rke2-* via OS patch breaks the AS cluster."
+    log "${RED}[FAIL]${RESET}          RKE2 version is managed by AS upgrade — not OS patch."
+    log "${RED}[FAIL]${RESET}          Fix option 1 (permanent — recommended):"
+    log "${RED}[FAIL]${RESET}            echo 'exclude=rke2-*' >> /etc/yum.conf"
+    log "${RED}[FAIL]${RESET}          Fix option 2 (per patch run — pass to patch orchestrator):"
+    log "${RED}[FAIL]${RESET}            yum upgrade --exclude \"rke2-*\""
   fi
 }
 
