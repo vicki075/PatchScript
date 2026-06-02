@@ -48,6 +48,11 @@ readonly ETCD_CERT="/var/lib/rancher/rke2/server/tls/etcd/server-client.crt"
 readonly ETCD_KEY="/var/lib/rancher/rke2/server/tls/etcd/server-client.key"
 readonly ETCD_ENDPOINT="https://127.0.0.1:2379"
 
+readonly CRICTL="/var/lib/rancher/rke2/bin/crictl"
+readonly CRI_CONFIG="/var/lib/rancher/rke2/agent/etc/crictl.yaml"
+ETCD_EXEC_MODE=""
+ETCD_CONTAINER_ID=""
+
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 readonly BACKUP_BASE="/opt/UiPathAutomationSuite/backup_patch"
 
@@ -124,15 +129,47 @@ acquire_lock() {
 }
 
 # =============================================================================
-# ETCDCTL
+# ETCDCTL — host binary first, crictl container exec fallback
+# (identical to 03-prepatch.sh)
 # =============================================================================
+init_etcd_access() {
+  if [[ -x "${ETCDCTL}" ]]; then
+    ETCD_EXEC_MODE="host"
+    return 0
+  fi
+  if [[ ! -x "${CRICTL}" ]]; then return 1; fi
+  local container_id
+  container_id=$(CRI_CONFIG_FILE="${CRI_CONFIG}" \
+    "${CRICTL}" ps --label io.kubernetes.container.name=etcd --quiet 2>/dev/null | head -1)
+  if [[ -z "${container_id}" ]]; then return 1; fi
+  ETCD_EXEC_MODE="container"
+  ETCD_CONTAINER_ID="${container_id}"
+  return 0
+}
+
 etcdctl_cmd() {
-  "${ETCDCTL}" \
-    --endpoints="${ETCD_ENDPOINT}" \
-    --cacert="${ETCD_CACERT}" \
-    --cert="${ETCD_CERT}" \
-    --key="${ETCD_KEY}" \
-    "$@"
+  case "${ETCD_EXEC_MODE}" in
+    host)
+      "${ETCDCTL}" \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "$@"
+      ;;
+    container)
+      CRI_CONFIG_FILE="${CRI_CONFIG}" \
+      "${CRICTL}" exec -i "${ETCD_CONTAINER_ID}" \
+        etcdctl \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "$@"
+      ;;
+    *)
+      echo "etcdctl not available (ETCD_EXEC_MODE unset)" >&2; return 1 ;;
+  esac
 }
 
 # =============================================================================
@@ -213,85 +250,62 @@ detect_my_node() {
 
 detect_leader() {
   if [[ "${IS_SERVER}" != "true" ]]; then
-    IS_LEADER=false
-    LEADER_NODE=""
-    return 0
+    IS_LEADER=false; LEADER_NODE=""; return 0
   fi
 
-  if [[ ! -x "${ETCDCTL}" ]]; then
-    warn "etcdctl not found at ${ETCDCTL} — skipping leader detection"
-    IS_LEADER=false
-    LEADER_NODE=""
-    return 0
+  if ! init_etcd_access; then
+    warn "etcdctl not available (no host binary, no etcd container via crictl) — skipping leader detection"
+    IS_LEADER=false; LEADER_NODE=""; return 0
   fi
 
-  # Local endpoint status — compare member_id == leader
+  # Am I the leader? Compare local member_id to leader field
   local local_status
-  local_status=$(etcdctl_cmd endpoint status \
-    --endpoints=127.0.0.1:2379 -w json 2>/dev/null || true)
+  local_status=$(etcdctl_cmd endpoint status -w json 2>/dev/null || true)
 
   if [[ -z "${local_status}" ]]; then
     warn "etcdctl endpoint status returned empty — skipping leader detection"
-    IS_LEADER=false
-    LEADER_NODE=""
-    return 0
+    IS_LEADER=false; LEADER_NODE=""; return 0
   fi
 
   IS_LEADER=$(echo "${local_status}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-if isinstance(data, list):
-    e = data[0]
-else:
-    e = data
+e = data[0] if isinstance(data, list) else data
 st = e.get('Status', {})
-member_id = st.get('header', {}).get('member_id', -1)
-leader_id = st.get('leader', -2)
-print('true' if member_id == leader_id else 'false')
+print('true' if st.get('header', {}).get('member_id', -1) == st.get('leader', -2) else 'false')
 " 2>/dev/null || echo "false")
 
-  # Resolve LEADER_NODE name via cluster-wide status + node IP map
-  local cluster_status
-  cluster_status=$(etcdctl_cmd endpoint status \
-    --cluster -w json 2>/dev/null || true)
-
+  # Build IP→hostname map from kubectl (best-effort; may be empty if API is down)
   local node_ip_map
   node_ip_map=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
 import json, sys
-items = json.load(sys.stdin).get('items', [])
-for n in items:
+for n in json.load(sys.stdin).get('items', []):
     name = n['metadata']['name']
     for addr in n.get('status', {}).get('addresses', []):
         if addr.get('type') == 'InternalIP':
-            print(addr['address'], name)
-            break
+            print(addr['address'], name); break
 " 2>/dev/null || true)
+
+  # Resolve LEADER_NODE from cluster-wide endpoint status
+  local cluster_status
+  cluster_status=$(etcdctl_cmd endpoint status --cluster -w json 2>/dev/null || true)
 
   LEADER_NODE=$(echo "${cluster_status}" | python3 -c "
 import json, sys, os
 node_map = {}
 for line in os.environ.get('NODE_IP_MAP','').splitlines():
     parts = line.split(None, 1)
-    if len(parts) == 2:
-        node_map[parts[0]] = parts[1]
+    if len(parts) == 2: node_map[parts[0]] = parts[1]
 try:
     data = json.load(sys.stdin)
-    if not isinstance(data, list):
-        data = [data]
-    for e in data:
+    for e in (data if isinstance(data, list) else [data]):
         st = e.get('Status', {})
-        member_id = st.get('header', {}).get('member_id', -1)
-        leader_id = st.get('leader', -2)
-        if member_id == leader_id:
+        if st.get('header', {}).get('member_id', -1) == st.get('leader', -2):
             ep = e.get('Endpoint', '')
-            try:
-                ip = ep.split('//')[1].split(':')[0]
-            except Exception:
-                ip = ep
-            print(node_map.get(ip, ip))
-            break
-except Exception:
-    pass
+            try: ip = ep.split('//')[1].split(':')[0]
+            except: ip = ep
+            print(node_map.get(ip, ip)); break
+except: pass
 " NODE_IP_MAP="${node_ip_map}" 2>/dev/null || true)
 
   info "IS_LEADER=${IS_LEADER}  LEADER_NODE=${LEADER_NODE:-unknown}"
@@ -314,18 +328,48 @@ mode_identify_leader() {
   echo -e "\n${BOLD}--- Identifying etcd leader ---${RESET}"
 
   detect_role
-  detect_leader
 
-  if [[ -z "${LEADER_NODE}" ]]; then
-    warn "Could not resolve leader node name — etcdctl may not be available on this node"
-  else
-    log "${CYAN}[INFO]${RESET}  etcd leader: ${LEADER_NODE}"
-    echo ""
-    echo -e "${BOLD}Scheduling advice:${RESET}"
-    echo "  Stop order:  agents first → non-leader servers → ${LEADER_NODE} LAST"
-    echo "  Reboot order: ${LEADER_NODE} FIRST → other servers → agents"
+  if ! init_etcd_access; then
+    log "${RED}[FAIL]${RESET}  etcdctl not available — run on a server node with etcdctl at ${ETCDCTL}"
+    exit 1
   fi
 
+  # Build IP→hostname map
+  local node_ip_map
+  node_ip_map=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+import json, sys
+for n in json.load(sys.stdin).get('items', []):
+    name = n['metadata']['name']
+    for addr in n.get('status', {}).get('addresses', []):
+        if addr.get('type') == 'InternalIP':
+            print(addr['address'], name); break
+" 2>/dev/null || true)
+
+  log "${CYAN}[INFO]${RESET}  etcd cluster members:"
+  etcdctl_cmd endpoint status --cluster -w json 2>/dev/null \
+    | python3 -c "
+import json, sys, os
+node_map = {}
+for line in os.environ.get('NODE_IP_MAP','').splitlines():
+    parts = line.split(None, 1)
+    if len(parts) == 2: node_map[parts[0]] = parts[1]
+data = json.load(sys.stdin)
+for e in (data if isinstance(data, list) else [data]):
+    ep  = e.get('Endpoint','?')
+    st  = e.get('Status', {})
+    is_leader = st.get('header',{}).get('member_id',-1) == st.get('leader',-2)
+    try: ip = ep.split('//')[1].split(':')[0]
+    except: ip = ep
+    hostname = node_map.get(ip, ip)
+    label = '  <<< LEADER — stop this server LAST / reboot FIRST' if is_leader else ''
+    print(f'  {hostname}  ({ep}){label}')
+" NODE_IP_MAP="${node_ip_map}" 2>/dev/null \
+  || log "${YELLOW}[WARN]${RESET}  Could not parse cluster status — try: etcdctl endpoint status --cluster -w table"
+
+  echo ""
+  echo -e "${BOLD}  Schedule crons with 5-min gaps — LEADER LAST:${RESET}"
+  echo "    agents first → non-leader servers → LEADER LAST"
+  echo "  Reboot order after OS patch: LEADER FIRST → other servers → agents"
   echo ""
 }
 
@@ -337,8 +381,7 @@ phase_health_check() {
 
   # Check if maintenance mode is already enabled — if so, skip HC entirely
   local mm_raw
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
     pass "Phase 1: Maintenance mode already enabled — skipping health check"
