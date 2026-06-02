@@ -232,7 +232,9 @@ resolve_uipathctl() {
   #    Binary lives at <version-folder>/installer/bin/uipathctl.
   local inst_dir="${INSTALLER_DIR:-${UIPATH_INSTALLER_DIR:-}}"
   if [[ -n "${inst_dir}" ]]; then
-    inst_dir="${inst_dir%/}"    # strip trailing slash
+    inst_dir="${inst_dir%/}"              # strip trailing /
+    inst_dir="${inst_dir%/installer/bin}" # tolerate .../installer/bin
+    inst_dir="${inst_dir%/installer}"     # tolerate .../2024.10.4/installer
     local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
@@ -815,8 +817,8 @@ main() {
   for arg in "$@"; do
     case "${arg}" in
       --verbose|--debug|-v) VERBOSE=true ;;
-      --installer-dir=*)
-        INSTALLER_DIR="${arg#--installer-dir=}"
+      --installer-dir=*|--install-dir=*)
+        INSTALLER_DIR="${arg#*=}"
         ;;
       --help|-h)
         echo "Usage: $0 [--verbose] [--installer-dir=<path>]"

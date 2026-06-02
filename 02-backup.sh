@@ -94,9 +94,18 @@ state_log() {
 }
 
 # =============================================================================
-# UIPATHCTL RESOLUTION — mirrors 01-preflight.sh
+# UIPATHCTL RESOLUTION — same convention as all other pre-patch scripts
+# Priority: PATH → --installer-dir flag → UIPATH_INSTALLER_DIR env var →
+#           /opt/UiPathAutomationSuite/latest/... fixed path
+#
+# --installer-dir / --install-dir accept the UiPath version folder:
+#   /opt/UiPathAutomationSuite/2024.10.4
+# Path depth is normalised — any of these work:
+#   .../2024.10.4  .../2024.10.4/  .../2024.10.4/installer  .../2024.10.4/installer/
+# Binary resolved to: <version-folder>/installer/bin/uipathctl
 # =============================================================================
 UIPATHCTL_BIN=""
+INSTALLER_DIR=""   # set by --installer-dir / --install-dir flag
 
 resolve_uipathctl() {
   if command -v uipathctl &>/dev/null; then
@@ -104,32 +113,26 @@ resolve_uipathctl() {
     return 0
   fi
 
-  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
-    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+  # --installer-dir flag or UIPATH_INSTALLER_DIR env var (backward compat)
+  local inst_dir="${INSTALLER_DIR:-${UIPATH_INSTALLER_DIR:-}}"
+  if [[ -n "${inst_dir}" ]]; then
+    inst_dir="${inst_dir%/}"              # strip trailing /
+    inst_dir="${inst_dir%/installer/bin}" # tolerate .../installer/bin
+    inst_dir="${inst_dir%/installer}"     # tolerate .../2024.10.4/installer
+    local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
       export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
       return 0
+    else
+      warn "--installer-dir='${inst_dir}': ${candidate} not found or not executable"
     fi
   fi
 
-  local known_paths=(
-    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
-    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
-  )
-  local p
-  for p in "${known_paths[@]}"; do
-    if [[ -x "${p}" ]]; then
-      UIPATHCTL_BIN="${p}"
-      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
-      return 0
-    fi
-  done
-
-  local found
-  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null | head -1)
-  if [[ -n "${found}" && -x "${found}" ]]; then
-    UIPATHCTL_BIN="${found}"
+  # Fixed well-known path via 'latest' symlink
+  local fixed="/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  if [[ -x "${fixed}" ]]; then
+    UIPATHCTL_BIN="${fixed}"
     export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
     return 0
   fi
@@ -360,7 +363,7 @@ verify_cluster_after_backup() {
     # is-enabled returns "true"/"false" or a descriptive string — use grep-based check
     if [[ -n "${UIPATHCTL_BIN}" ]] || resolve_uipathctl; then
       local mm_raw mm_on=false
-      mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled --namespace uipath 2>/dev/null || true)
+      mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
       if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
         echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
       fi
@@ -371,8 +374,7 @@ verify_cluster_after_backup() {
       fi
     else
       log "${YELLOW}[WARN]${RESET}  POST-BACKUP: uipathctl not found — skipping maintenance mode check"
-      log "${YELLOW}[WARN]${RESET}          Try: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
-      log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+      log "${YELLOW}[WARN]${RESET}          Pass --installer-dir if needed: ./02-backup.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
     fi
   else
     log "${YELLOW}[WARN]${RESET}  POST-BACKUP: kubectl not available — skipping cluster health verification"
@@ -386,10 +388,14 @@ main() {
   for arg in "$@"; do
     case "${arg}" in
       --verbose|--debug|-v) VERBOSE=true ;;
+      --installer-dir=*|--install-dir=*) INSTALLER_DIR="${arg#*=}" ;;
       --help|-h)
-        echo "Usage: $0 [--verbose|--debug]"
+        echo "Usage: $0 [--verbose|--debug] [--installer-dir=<path>]"
         echo "  Default: only PASS/FAIL lines + summary"
-        echo "  --verbose / --debug: full output including INFO and command detail"
+        echo "  --verbose / --debug        Full output including INFO and command detail"
+        echo "  --installer-dir=<path>     UiPath version folder (e.g. /opt/UiPathAutomationSuite/2024.10.4)"
+        echo "                             Also accepted: --install-dir=<path>"
+        echo "                             Used only for post-backup maintenance mode verification."
         exit 0 ;;
     esac
   done
@@ -405,8 +411,7 @@ main() {
     info "uipathctl resolved: ${UIPATHCTL_BIN}"
   else
     log "${YELLOW}[WARN]${RESET}  uipathctl not found — maintenance mode check will be skipped"
-    log "${YELLOW}[WARN]${RESET}          To enable: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
-    log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+    log "${YELLOW}[WARN]${RESET}          Pass --installer-dir if needed: ./02-backup.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
   fi
   echo ""
 

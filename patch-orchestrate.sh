@@ -262,7 +262,10 @@ resolve_uipathctl() {
   fi
 
   if [[ -n "${INSTALLER_DIR}" ]]; then
-    local candidate="${INSTALLER_DIR%/}/installer/bin/uipathctl"
+    local inst_dir="${INSTALLER_DIR%/}"
+    inst_dir="${inst_dir%/installer/bin}"
+    inst_dir="${inst_dir%/installer}"
+    local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
       export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
@@ -879,7 +882,7 @@ main() {
   # Parse arguments
   for arg in "$@"; do
     case "${arg}" in
-      --installer-dir=*) INSTALLER_DIR="${arg#*=}" ;;
+      --installer-dir=*|--install-dir=*) INSTALLER_DIR="${arg#*=}" ;;
       --ssh-user=*)      SSH_USER="${arg#*=}" ;;
       --ssh-password=*)  SSH_PASSWORD="${arg#*=}" ;;
       --ssh-port=*)      SSH_PORT="${arg#*=}" ;;
