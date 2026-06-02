@@ -100,7 +100,8 @@ usage() {
   echo "Usage: $0 [OPTIONS]"
   echo ""
   echo "  --installer-dir=<path>   UiPath version folder; binary at <dir>/installer/bin/uipathctl"
-  echo "  --skip-hc=comp1,comp2   Health check component names to skip if they fail"
+  echo "  --skip-hc=all           Skip health check failures entirely"
+  echo "  --skip-hc=comp1,comp2   Skip specific failing components by name"
   echo "  --identify-leader        Print leader name and scheduling advice, then exit"
   echo "  --verbose                Show INFO lines"
   echo "  --help                   Show this help"
@@ -367,31 +368,37 @@ phase_health_check() {
   done <<< "${cleaned}"
 
   if [[ ${#failed_components[@]} -eq 0 ]]; then
-    abort "Phase 1: Health check command failed — check binary version/path"
+    abort "Phase 1: Health check command failed — check binary version/path (use --installer-dir)"
   fi
 
-  # Check each failed component against skip list
+  # --skip-hc=all  →  ignore every failure
+  for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
+    if [[ "${skip_comp,,}" == "all" ]]; then
+      warn "Phase 1: Health check had failures — skipped (--skip-hc=all): ${failed_components[*]}"
+      return 0
+    fi
+  done
+
+  # Check each failed component against the explicit skip list
   local unresolved=()
   for comp in "${failed_components[@]}"; do
     local skip=false
-    for skip_comp in "${SKIP_HC_COMPONENTS[@]}"; do
+    for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
       if [[ "${comp,,}" == "${skip_comp,,}" ]]; then
         skip=true
         break
       fi
     done
-    if [[ "${skip}" == "false" ]]; then
-      unresolved+=("${comp}")
-    fi
+    [[ "${skip}" == "false" ]] && unresolved+=("${comp}")
   done
 
   if [[ ${#unresolved[@]} -gt 0 ]]; then
     local unresolved_str
     unresolved_str=$(IFS=','; echo "${unresolved[*]}")
-    abort "Phase 1: Health check failed — unresolved components: ${unresolved_str}. Add to --skip-hc if safe to proceed."
+    abort "Phase 1: Health check failed — unresolved: ${unresolved_str}. Use --skip-hc=all to bypass or --skip-hc=comp1,comp2 for specific ones."
   fi
 
-  warn "Phase 1: Health check had failures but all failed components are in --skip-hc: ${failed_components[*]} — continuing"
+  warn "Phase 1: Health check had failures but all in --skip-hc list: ${failed_components[*]} — continuing"
 }
 
 # =============================================================================
