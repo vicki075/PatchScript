@@ -355,36 +355,42 @@ phase_health_check() {
     return 0
   fi
 
-  # Parse failed component names from lines with ❌ or " failed "
+  # Parse failed component names from ❌ lines.
+  # uipathctl output format:  ❌ [COMPONENTNAME]  or  ❌ [COMPONENTNAME_SUBCHECK] detail text
+  # Extract only the ALL-CAPS bracket token (strips brackets, ignores namespace/kind detail lines).
+  # Example: "  ❌ [DOCUMENTUNDERSTANDING_HEALTH] health status is Progressing"
+  #       →  "DOCUMENTUNDERSTANDING_HEALTH"
   local failed_components=()
   while IFS= read -r line; do
-    if echo "${line}" | grep -qE '❌| failed '; then
+    if echo "${line}" | grep -qE '❌'; then
       local comp
-      comp=$(echo "${line}" | awk '{print $2}')
-      if [[ -n "${comp}" ]]; then
-        failed_components+=("${comp}")
-      fi
+      comp=$(echo "${line}" | grep -oE '\[[A-Z_]+\]' | head -1 | tr -d '[]')
+      [[ -n "${comp}" ]] && failed_components+=("${comp}")
     fi
   done <<< "${cleaned}"
 
   if [[ ${#failed_components[@]} -eq 0 ]]; then
+    # hc_exit != 0 but no ❌ lines parsed — command-level error
     abort "Phase 1: Health check command failed — check binary version/path (use --installer-dir)"
   fi
 
   # --skip-hc=all  →  ignore every failure
   for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
     if [[ "${skip_comp,,}" == "all" ]]; then
-      warn "Phase 1: Health check had failures — skipped (--skip-hc=all): ${failed_components[*]}"
+      warn "Phase 1: Health check had failures — skipped via --skip-hc=all: ${failed_components[*]}"
       return 0
     fi
   done
 
-  # Check each failed component against the explicit skip list
+  # Check each failed component against the explicit skip list.
+  # Prefix match: --skip-hc=DOCUMENTUNDERSTANDING covers both
+  # DOCUMENTUNDERSTANDING and DOCUMENTUNDERSTANDING_HEALTH.
   local unresolved=()
   for comp in "${failed_components[@]}"; do
     local skip=false
     for skip_comp in "${SKIP_HC_COMPONENTS[@]:-}"; do
-      if [[ "${comp,,}" == "${skip_comp,,}" ]]; then
+      # prefix match (case-insensitive): skip_comp matches comp if comp starts with skip_comp
+      if [[ "${comp,,}" == "${skip_comp,,}"* ]]; then
         skip=true
         break
       fi
@@ -395,10 +401,13 @@ phase_health_check() {
   if [[ ${#unresolved[@]} -gt 0 ]]; then
     local unresolved_str
     unresolved_str=$(IFS=','; echo "${unresolved[*]}")
-    abort "Phase 1: Health check failed — unresolved: ${unresolved_str}. Use --skip-hc=all to bypass or --skip-hc=comp1,comp2 for specific ones."
+    log "${YELLOW}[WARN]${RESET}  Failed components not in skip list:"
+    for c in "${unresolved[@]}"; do log "${YELLOW}[WARN]${RESET}    ❌  ${c}"; done
+    abort "Phase 1: Health check failed — unresolved: ${unresolved_str}
+  Use --skip-hc=all to bypass everything, or --skip-hc=SYNC,DOCUMENTUNDERSTANDING for specific ones."
   fi
 
-  warn "Phase 1: Health check had failures but all in --skip-hc list: ${failed_components[*]} — continuing"
+  warn "Phase 1: Health check had failures — all covered by --skip-hc: ${failed_components[*]} — continuing"
 }
 
 # =============================================================================
