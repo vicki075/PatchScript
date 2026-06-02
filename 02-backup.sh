@@ -26,9 +26,9 @@
 #   1  — backup failed; cluster state is UNCHANGED; investigate before continuing
 #
 # Usage:
-#   export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
 #   chmod +x 02-backup.sh
 #   ./02-backup.sh
+#   ./02-backup.sh --verbose     # full output including INFO lines
 # =============================================================================
 set -uo pipefail
 
@@ -71,11 +71,14 @@ readonly CHECKSUM_RETRY=1          # retry once on checksum mismatch before abor
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
+# Verbosity — default quiet; set by --verbose / --debug flag
+VERBOSE=false
+
 ts()   { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log()  { echo -e "$(ts)  $*"; }
-info() { log "${CYAN}[INFO]${RESET}  $*"; }
+info() { [[ "${VERBOSE}" == "true" ]] && log "${CYAN}[INFO]${RESET}  $*" || true; }
 pass() { log "${GREEN}[PASS]${RESET}  $*"; }
-warn() { log "${YELLOW}[WARN]${RESET}  $*"; }
+warn() { [[ "${VERBOSE}" == "true" ]] && log "${YELLOW}[WARN]${RESET}  $*" || true; }
 
 fail() {
   local msg="$*"
@@ -90,29 +93,86 @@ state_log() {
   echo "$(ts)  $*" >> "${STATE_LOG}" 2>/dev/null || true
 }
 
-etcdctl_cmd() {
-  "${ETCDCTL}" \
-    --endpoints="${ETCD_ENDPOINT}" \
-    --cacert="${ETCD_CACERT}" \
-    --cert="${ETCD_CERT}" \
-    --key="${ETCD_KEY}" \
-    "$@"
+# =============================================================================
+# UIPATHCTL RESOLUTION — mirrors 01-preflight.sh
+# =============================================================================
+UIPATHCTL_BIN=""
+
+resolve_uipathctl() {
+  if command -v uipathctl &>/dev/null; then
+    UIPATHCTL_BIN="$(command -v uipathctl)"
+    return 0
+  fi
+
+  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
+    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+    if [[ -x "${candidate}" ]]; then
+      UIPATHCTL_BIN="${candidate}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    fi
+  fi
+
+  local known_paths=(
+    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
+  )
+  local p
+  for p in "${known_paths[@]}"; do
+    if [[ -x "${p}" ]]; then
+      UIPATHCTL_BIN="${p}"
+      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+      return 0
+    fi
+  done
+
+  local found
+  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null | head -1)
+  if [[ -n "${found}" && -x "${found}" ]]; then
+    UIPATHCTL_BIN="${found}"
+    export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
+    return 0
+  fi
+
+  return 1
 }
 
 # =============================================================================
 # GUARD: must run on a server node
+# Detection is based on server config/data presence — NOT service state.
+# rke2-server may be 'activating' (waiting for etcd leader after another node
+# stopped) or 'inactive' (stopped by a prior prepatch run). Snapshots are
+# static files; the service does not need to be running to copy them.
 # =============================================================================
 guard_server_node() {
-  if ! systemctl is-active --quiet rke2-server 2>/dev/null; then
-    fail "This script must run on a SERVER node (rke2-server.service active). Detected: agent or uninitialized node on $(hostname)."
+  local is_server=false
+  if [[ -f "/etc/rancher/rke2/rke2.yaml" ]] || \
+     [[ -d "/var/lib/rancher/rke2/server/db/snapshots" ]] || \
+     [[ -d "/var/lib/rancher/rke2/server/tls" ]]; then
+    is_server=true
   fi
-  info "Confirmed server node: $(hostname)"
+
+  if [[ "${is_server}" == "false" ]]; then
+    fail "This script must run on a SERVER node. No server config or snapshot directory found on $(hostname). Agent nodes do not have etcd snapshots to back up."
+  fi
+
+  # Report actual service state — informational only, does not gate the backup
+  local svc_state
+  svc_state=$(systemctl is-active rke2-server 2>/dev/null || echo "unknown")
+  info "Server node confirmed: $(hostname)  (rke2-server: ${svc_state})"
+
+  if [[ "${svc_state}" != "active" ]]; then
+    log "${YELLOW}[WARN]${RESET}  rke2-server is '${svc_state}' on $(hostname) — snapshot files are on disk and can be copied regardless of service state"
+  fi
 }
 
 # =============================================================================
 # STEP 1: Identify the last SNAP_MIN_COUNT snapshots by filename epoch
-# Returns newline-separated list of filenames (not full paths), newest last.
+# Result written to global SNAPSHOT_LIST (newline-separated filenames, newest last).
+# NOT captured via $() — avoids stdout collision with info() in verbose mode.
 # =============================================================================
+SNAPSHOT_LIST=""
+
 identify_snapshots() {
   info "Identifying last ${SNAP_MIN_COUNT} snapshots in ${SNAP_DIR} on $(hostname)..."
 
@@ -129,8 +189,7 @@ identify_snapshots() {
 
   # Sort by unix epoch embedded in filename (authoritative — not file mtime)
   # Filename format: etcd-snapshot-<hostname>-<unix-epoch>[.zip]
-  local sorted_snaps
-  sorted_snaps=$(ls -1 "${SNAP_DIR}/" \
+  SNAPSHOT_LIST=$(ls -1 "${SNAP_DIR}/" \
     | grep "^etcd-snapshot-" \
     | while read -r f; do
         ep=$(echo "${f}" | grep -oE '[0-9]{9,11}' | tail -1)
@@ -140,14 +199,14 @@ identify_snapshots() {
     | tail -"${SNAP_MIN_COUNT}" \
     | awk '{print $2}')
 
-  if [[ -z "${sorted_snaps}" ]]; then
+  if [[ -z "${SNAPSHOT_LIST}" ]]; then
     fail "Could not identify any snapshots with parseable epoch timestamps in ${SNAP_DIR}"
   fi
 
   info "Selected snapshots (newest last):"
-  echo "${sorted_snaps}" | sed 's/^/  /'
-
-  echo "${sorted_snaps}"
+  if [[ "${VERBOSE}" == "true" ]]; then
+    echo "${SNAPSHOT_LIST}" | sed 's/^/  /'
+  fi
 }
 
 # =============================================================================
@@ -180,7 +239,7 @@ validate_snapshot() {
   age_hours=$(( ( $(date +%s) - epoch ) / 3600 ))
 
   if [[ "${age_hours}" -gt "${SNAP_FRESHNESS_HOURS}" ]]; then
-    fail "Snapshot ${snap_file} is ${age_hours}h old (threshold: ${SNAP_FRESHNESS_HOURS}h). Scheduled snapshots may have stopped."
+    warn "  Snapshot ${snap_file} is ${age_hours}h old (threshold: ${SNAP_FRESHNESS_HOURS}h) — proceeding with copy"
   fi
 
   info "  Age: ${age_hours}h  ✓  (threshold: ${SNAP_FRESHNESS_HOURS}h)"
@@ -281,8 +340,11 @@ verify_cluster_after_backup() {
     local not_ready
     not_ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}')
     if [[ -n "${not_ready}" ]]; then
-      warn "POST-BACKUP: Following nodes not Ready (unexpected — investigate):"
-      echo "${not_ready}" | sed 's/^/  /'
+      local nr_count; nr_count=$(echo "${not_ready}" | wc -l | tr -d ' ')
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: ${nr_count} node(s) not Ready — expected if prior --stop-server runs have completed"
+      if [[ "${VERBOSE}" == "true" ]]; then
+        echo "${not_ready}" | sed 's/^/  /'
+      fi
     else
       info "POST-BACKUP: All nodes still Ready  ✓"
     fi
@@ -291,20 +353,29 @@ verify_cluster_after_backup() {
     if kubectl get --raw='/readyz' &>/dev/null 2>&1; then
       info "POST-BACKUP: API server /readyz OK  ✓"
     else
-      warn "POST-BACKUP: API server /readyz check failed — unexpected, investigate"
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: API server /readyz check failed — unexpected, investigate"
     fi
 
     # Maintenance mode still set
-    local mm
-    mm=$(uipathctl cluster maintenance is-enabled --namespace uipath 2>/dev/null \
-      | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || echo "unknown")
-    if [[ "${mm}" == "true" ]]; then
-      info "POST-BACKUP: Maintenance mode still enabled  ✓"
+    # is-enabled returns "true"/"false" or a descriptive string — use grep-based check
+    if [[ -n "${UIPATHCTL_BIN}" ]] || resolve_uipathctl; then
+      local mm_raw mm_on=false
+      mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled --namespace uipath 2>/dev/null || true)
+      if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
+        echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
+      fi
+      if [[ "${mm_on}" == "true" ]]; then
+        info "POST-BACKUP: Maintenance mode still enabled  ✓"
+      else
+        log "${YELLOW}[WARN]${RESET}  POST-BACKUP: Maintenance mode does not appear enabled (is-enabled: '${mm_raw}') — verify manually"
+      fi
     else
-      warn "POST-BACKUP: Maintenance mode is-enabled returned '${mm}' — expected 'true'"
+      log "${YELLOW}[WARN]${RESET}  POST-BACKUP: uipathctl not found — skipping maintenance mode check"
+      log "${YELLOW}[WARN]${RESET}          Try: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
+      log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
     fi
   else
-    warn "POST-BACKUP: kubectl not available — skipping cluster health verification"
+    log "${YELLOW}[WARN]${RESET}  POST-BACKUP: kubectl not available — skipping cluster health verification"
   fi
 }
 
@@ -312,10 +383,32 @@ verify_cluster_after_backup() {
 # MAIN
 # =============================================================================
 main() {
+  for arg in "$@"; do
+    case "${arg}" in
+      --verbose|--debug|-v) VERBOSE=true ;;
+      --help|-h)
+        echo "Usage: $0 [--verbose|--debug]"
+        echo "  Default: only PASS/FAIL lines + summary"
+        echo "  --verbose / --debug: full output including INFO and command detail"
+        exit 0 ;;
+    esac
+  done
+
   echo -e "\n${BOLD}================================================================${RESET}"
   echo -e "${BOLD}  UiPath AS 24.10.4 / RKE2 — Pre-Patch Backup${RESET}"
   echo -e "${BOLD}  Node: $(hostname)   |   $(ts)${RESET}"
+  [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
+
+  # Resolve uipathctl once; verify_cluster_after_backup() uses UIPATHCTL_BIN
+  if resolve_uipathctl; then
+    info "uipathctl resolved: ${UIPATHCTL_BIN}"
+  else
+    log "${YELLOW}[WARN]${RESET}  uipathctl not found — maintenance mode check will be skipped"
+    log "${YELLOW}[WARN]${RESET}          To enable: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./02-backup.sh"
+    log "${YELLOW}[WARN]${RESET}          Expected binary: /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  fi
+  echo ""
 
   # Guard: server nodes only
   guard_server_node
@@ -332,8 +425,7 @@ main() {
   # Step 1 + 2 + 3: Identify, validate, and copy snapshots
   echo ""
   info "--- Phase B.1: etcd Snapshot Safety Net ---"
-  local snapshot_list
-  snapshot_list=$(identify_snapshots)
+  identify_snapshots   # populates global SNAPSHOT_LIST
 
   while IFS= read -r snap_name; do
     [[ -z "${snap_name}" ]] && continue
@@ -342,7 +434,7 @@ main() {
     copy_snapshot "${snap_path}" "${ETCD_DEST}"
     pass "Snapshot copied and verified: ${snap_name}"
     echo ""
-  done <<< "${snapshot_list}"
+  done <<< "${SNAPSHOT_LIST}"
 
   # Step 4: RKE2 config backup
   echo ""
@@ -352,7 +444,9 @@ main() {
   # Summary of what was written
   echo ""
   info "--- Backup Contents ---"
-  find "${DEST_DIR}" -type f | sort | sed 's/^/  /'
+  if [[ "${VERBOSE}" == "true" ]]; then
+    find "${DEST_DIR}" -type f | sort | sed 's/^/  /'
+  fi
 
   # Step 5: Post-backup health check
   echo ""

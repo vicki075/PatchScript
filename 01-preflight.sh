@@ -6,9 +6,9 @@
 #           pages/90751108300/Cluster+nodes+Pre-Patch+Tasks  (v1.1)
 #
 # Execution model:
-#   Run on the PRIMARY SERVER NODE for full coverage (all 9 checks).
-#   Run on EVERY NODE for local checks only (PF-05, PF-06, PF-09).
-#   Script auto-detects role based on kubectl + KUBECONFIG availability.
+#   Run ONCE on the PRIMARY SERVER NODE before any patching begins.
+#   All 9 checks run against the live cluster. Do NOT re-run mid-patch
+#   (nodes will be cordoned/stopped; cluster state is intentionally degraded).
 #
 # Error handling:
 #   ALL applicable checks run regardless of individual failures.
@@ -24,9 +24,10 @@
 #
 #   What causes FAIL vs WARN:
 #     FAIL: node not Ready, etcd unhealthy, API server down, critical disk (<rancher/<kubelet),
-#           maintenance mode already set, uipathctl not found (needed for maintenance mode)
+#           maintenance mode already set, uipathctl not found (needed for maintenance mode),
+#           RKE2 package exclusion missing (yum upgrade would silently upgrade rke2 binaries)
 #     WARN: pod CrashLoop/stuck Terminating (pre-existing app issues), /var or /opt low disk,
-#           RKE2 package pin missing, UiPath health check failures, stale/missing etcd snapshots
+#           UiPath health check failures, stale/missing etcd snapshots
 #
 #   Exception: truly fatal infra errors (kubectl unavailable, topology broken)
 #   still abort immediately — subsequent checks would be meaningless.
@@ -35,13 +36,15 @@
 #   1. Host binary: /var/lib/rancher/rke2/bin/etcdctl
 #   2. Container exec via crictl (clusters where etcdctl lives inside the etcd container)
 #
-# uipathctl resolution (auto-detected, in priority order):
+# uipathctl resolution (in priority order):
 #   1. PATH
-#   2. UIPATH_INSTALLER_DIR env var:  <dir>/bin/uipathctl
-#   3. /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl
-#   4. find /opt/UiPathAutomationSuite -name uipathctl (capped depth)
+#   2. --installer-dir flag or UIPATH_INSTALLER_DIR env var:
+#        <dir>/installer/bin/uipathctl
+#        (pass the UiPath version folder, e.g. /opt/UiPathAutomationSuite/2024.10.4)
+#   3. /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl  (fixed symlink)
 #
-#   Override: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh
+#   If auto-discovery fails:
+#     ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4
 #
 # Exit codes:
 #   0  — all checks passed (or passed with warnings only)
@@ -96,6 +99,7 @@ readonly CRI_CONFIG="/var/lib/rancher/rke2/agent/etc/crictl.yaml"
 ETCD_EXEC_MODE=""
 ETCD_CONTAINER_ID=""
 UIPATHCTL_BIN=""
+INSTALLER_DIR=""   # set by --installer-dir flag or UIPATH_INSTALLER_DIR env
 
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 
@@ -217,44 +221,37 @@ etcdctl_cmd() {
 # UIPATHCTL RESOLUTION
 # =============================================================================
 resolve_uipathctl() {
+  # 1. uipathctl already on PATH
   if command -v uipathctl &>/dev/null; then
     UIPATHCTL_BIN="$(command -v uipathctl)"
     return 0
   fi
 
-  if [[ -n "${UIPATH_INSTALLER_DIR:-}" ]]; then
-    local candidate="${UIPATH_INSTALLER_DIR}/bin/uipathctl"
+  # 2. --installer-dir flag or UIPATH_INSTALLER_DIR env var.
+  #    Both accept the UiPath version folder (e.g. /opt/UiPathAutomationSuite/2024.10.4).
+  #    Binary lives at <version-folder>/installer/bin/uipathctl.
+  local inst_dir="${INSTALLER_DIR:-${UIPATH_INSTALLER_DIR:-}}"
+  if [[ -n "${inst_dir}" ]]; then
+    inst_dir="${inst_dir%/}"    # strip trailing slash
+    local candidate="${inst_dir}/installer/bin/uipathctl"
     if [[ -x "${candidate}" ]]; then
       UIPATHCTL_BIN="${candidate}"
       export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
       return 0
     else
-      warn "UIPATH_INSTALLER_DIR='${UIPATH_INSTALLER_DIR}' set but ${candidate} not found/executable"
+      warn "--installer-dir='${inst_dir}': ${candidate} not found or not executable"
     fi
   fi
 
-  local known_paths=(
-    "/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
-    "/opt/UiPathAutomationSuite/installer/bin/uipathctl"
-  )
-  local p
-  for p in "${known_paths[@]}"; do
-    if [[ -x "${p}" ]]; then
-      UIPATHCTL_BIN="${p}"
-      export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
-      return 0
-    fi
-  done
-
-  local found
-  found=$(find /opt/UiPathAutomationSuite -name uipathctl -maxdepth 6 -type f 2>/dev/null \
-    | head -1)
-  if [[ -n "${found}" && -x "${found}" ]]; then
-    UIPATHCTL_BIN="${found}"
+  # 3. Fixed well-known path via 'latest' symlink
+  local fixed="/opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+  if [[ -x "${fixed}" ]]; then
+    UIPATHCTL_BIN="${fixed}"
     export PATH="$(dirname "${UIPATHCTL_BIN}"):${PATH}"
     return 0
   fi
 
+  # Not found — caller handles the failure
   return 1
 }
 
@@ -319,10 +316,10 @@ discover_topology() {
 
 # =============================================================================
 # PF-01 — All nodes Ready; none pre-cordoned
-# Severity: FAIL — node state directly affects drain/stop sequencing
+# Severity: FAIL — unexpected stale state means the cluster was not clean before patching started.
 # =============================================================================
 pf01_node_readiness() {
-  info "PF-01: Checking all ${DISCOVERED_TOTAL_NODES} nodes Ready, none pre-cordoned..."
+  info "PF-01: Checking node readiness and cordon state..."
   local pf01_ok=true
 
   local not_ready
@@ -568,17 +565,29 @@ pf05_disk_space() {
 
 # =============================================================================
 # PF-06 — RKE2 package pin (LOCAL NODE)
-# Severity: WARN — important advisory; OS patch tool may upgrade RKE2 if absent,
-#           but this does not prevent the patch window from starting.
+# Severity: FAIL — if rke2-* is not excluded, yum upgrade may silently upgrade
+#           RKE2 binaries to an untested version, breaking the AS cluster.
+#           Ref: UiPath AS docs — "rke2-* package upgrade will be handled via
+#           the Automation Suite upgrade" (not via OS patch).
+# Two remediation paths:
+#   Permanent : echo 'exclude=rke2-*' >> /etc/yum.conf
+#   Per-run   : yum upgrade --exclude "rke2-*"   (pass to patch orchestrator)
 # =============================================================================
 pf06_rke2_package_pin() {
-  info "PF-06: Checking RKE2 package pin on $(hostname)..."
+  info "PF-06: Checking RKE2 package exclusion on $(hostname)..."
 
-  if grep -qr 'exclude=rke2-\*' /etc/yum.conf /etc/yum.repos.d/ 2>/dev/null; then
-    pass "PF-06: RKE2 package pin (exclude=rke2-*) confirmed on $(hostname)"
+  # Match both 'exclude=rke2-*' and 'excludepkgs=rke2-*' (dnf style),
+  # with optional whitespace around '=' and before 'rke2'
+  if grep -Erq 'exclude(pkgs)?\s*=\s*rke2' /etc/yum.conf /etc/yum.repos.d/ /etc/dnf/dnf.conf 2>/dev/null; then
+    pass "PF-06: RKE2 package exclusion confirmed on $(hostname)"
   else
-    check_warn "PF-06" \
-      "RKE2 package pin missing on $(hostname) — OS patch may inadvertently upgrade RKE2 binaries. Add 'exclude=rke2-*' to yum config."
+    check_fail "PF-06" "RKE2 package exclusion missing on $(hostname)"
+    log "${RED}[FAIL]${RESET}          Upgrading rke2-* via OS patch breaks the AS cluster."
+    log "${RED}[FAIL]${RESET}          RKE2 version is managed by AS upgrade — not OS patch."
+    log "${RED}[FAIL]${RESET}          Fix option 1 (permanent — recommended):"
+    log "${RED}[FAIL]${RESET}            echo 'exclude=rke2-*' >> /etc/yum.conf"
+    log "${RED}[FAIL]${RESET}          Fix option 2 (per patch run — pass to patch orchestrator):"
+    log "${RED}[FAIL]${RESET}            yum upgrade --exclude \"rke2-*\""
   fi
 }
 
@@ -593,34 +602,45 @@ pf07_uipath_health() {
 
   if [[ -z "${UIPATHCTL_BIN}" ]]; then
     check_fail "PF-07" \
-      "uipathctl not found — required for maintenance mode (Phase A). Set UIPATH_INSTALLER_DIR. Example: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh"
+      "uipathctl not found — required for maintenance mode (Phase 2). Pass --installer-dir. Example: ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
     return
   fi
 
   info "PF-07: Using ${UIPATHCTL_BIN}"
 
-  # Capture stdout; suppress logrus INFO[xxxx] lines (stderr) unless verbose
+  # uipathctl health check writes all output (structured + logrus noise) to stderr.
+  # Capture stderr+stdout together (2>&1), then strip pure logrus lines
+  # (^INFO[0009] / ^WARN[0009] / ^ERRO[0009] / ^DEBU[0009]).
+  # Structured health check lines have no logrus prefix — they pass through unchanged.
   local hc_output hc_exit=0
-  hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
-    2>/dev/null) || hc_exit=$?
+  hc_output=$("${UIPATHCTL_BIN}" health check --timeout 10m \
+    2>&1) || hc_exit=$?
+
+  # Strip only pure logrus noise lines; preserve everything else.
+  local clean_output
+  clean_output=$(echo "${hc_output}" \
+    | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' \
+    || true)
 
   if [[ "${hc_exit}" -ne 0 ]]; then
-    check_warn "PF-07" \
-      "uipathctl health check reported failures (pre-existing app issue — does not block OS patching)"
-    # Show failing components; in verbose mode show the full tree
-    if [[ "${VERBOSE}" == "true" ]]; then
-      echo "${hc_output}" | sed 's/^/  /'
+    # Distinguish: command-level error (bad flag, wrong binary) vs health check failures.
+    # Command errors start with "Error:" and produce no structured output.
+    if echo "${clean_output}" | grep -qE '^Error:'; then
+      check_warn "PF-07" \
+        "uipathctl health check did not complete — binary/command error (verify --installer-dir points to the correct version)"
+      log "${YELLOW}[WARN]${RESET}          Error output from uipathctl:"
     else
-      local failed_lines
-      failed_lines=$(echo "${hc_output}" | grep $'\xe2\x9d\x8c' || true)   # ❌ lines only
-      if [[ -n "${failed_lines}" ]]; then
-        echo "${failed_lines}" | sed 's/^/  /'
-      fi
+      check_warn "PF-07" \
+        "uipathctl health check reported failures (pre-existing app issue — does not block OS patching)"
     fi
+    echo "${clean_output}" | sed 's/^/  /'
     return
   fi
 
   pass "PF-07: UiPath health check passed"
+  if [[ "${VERBOSE}" == "true" ]]; then
+    echo "${clean_output}" | sed 's/^/  /'
+  fi
 }
 
 # =============================================================================
@@ -635,10 +655,14 @@ pf08_no_active_operation() {
     # uipathctl already caught as FAIL in PF-07; skip maintenance check to avoid double-reporting
     info "PF-08: Skipping maintenance mode check — uipathctl not found (see PF-07)"
   else
-    local mm_state
-    mm_state=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-      --namespace "${UIPATH_NS}" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    if [[ "${mm_state}" == "true" ]]; then
+    # is-enabled may return "true"/"false" or a descriptive string like
+    # "Maintenance mode is enabled" — check both forms; negatives take priority
+    local mm_raw mm_on=false
+    mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
+    if ! echo "${mm_raw}" | grep -qi "not\|false\|disabled"; then
+      echo "${mm_raw}" | grep -qi "true\|enabled" && mm_on=true || true
+    fi
+    if [[ "${mm_on}" == "true" ]]; then
       check_fail "PF-08" "Maintenance mode already enabled — investigate stale state before proceeding"
       pf08_ok=false
     fi
@@ -791,10 +815,17 @@ main() {
   for arg in "$@"; do
     case "${arg}" in
       --verbose|--debug|-v) VERBOSE=true ;;
+      --installer-dir=*)
+        INSTALLER_DIR="${arg#--installer-dir=}"
+        ;;
       --help|-h)
-        echo "Usage: $0 [--verbose|--debug]"
-        echo "  Default: only PASS/WARN/FAIL lines + summary"
-        echo "  --verbose / --debug: full output including INFO and command output"
+        echo "Usage: $0 [--verbose] [--installer-dir=<path>]"
+        echo ""
+        echo "  --installer-dir=<path>   UiPath version folder containing installer/bin/uipathctl"
+        echo "                           Example: --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
+        echo "  --verbose / --debug      Full output including INFO lines and command output"
+        echo ""
+        echo "  Alternatively: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/2024.10.4 ./01-preflight.sh"
         exit 0 ;;
     esac
   done
@@ -802,7 +833,8 @@ main() {
   echo -e "\n${BOLD}================================================================${RESET}"
   echo -e "${BOLD}  UiPath AS 24.10.4 / RKE2 — Pre-Patch Pre-Flight Checks${RESET}"
   echo -e "${BOLD}  Node: $(hostname)   |   $(ts)${RESET}"
-  [[ "${VERBOSE}" == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
+  [[ "${VERBOSE}"      == "true" ]] && echo -e "${CYAN}  Mode: verbose${RESET}"
+  [[ -n "${INSTALLER_DIR}" ]]     && echo -e "${CYAN}  --installer-dir: ${INSTALLER_DIR}${RESET}"
   echo -e "${BOLD}================================================================${RESET}\n"
 
   local is_server=false has_kubectl=false
@@ -827,9 +859,9 @@ main() {
     if resolve_uipathctl; then
       info "uipathctl resolved: ${UIPATHCTL_BIN}"
     else
-      warn "uipathctl not found in PATH or common locations"
-      warn "Set UIPATH_INSTALLER_DIR to the installer directory and re-run"
-      warn "  Example: UIPATH_INSTALLER_DIR=/opt/UiPathAutomationSuite/latest/installer ./01-preflight.sh"
+      warn "uipathctl not found in PATH or at /opt/UiPathAutomationSuite/latest/installer/bin/uipathctl"
+      warn "Pass --installer-dir with the UiPath version folder and re-run"
+      warn "  Example: ./01-preflight.sh --installer-dir=/opt/UiPathAutomationSuite/2024.10.4"
     fi
     echo ""
 
