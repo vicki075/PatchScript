@@ -637,17 +637,22 @@ pf07_uipath_health() {
 
   info "PF-07: Using ${UIPATHCTL_BIN}"
 
-  # uipathctl writes ALL output (structured check results + logrus lines) to stderr.
-  # Capture stderr+stdout together (2>&1), then strip logrus-prefixed lines
-  # (INFO[XXXX] / WARN[XXXX] / ERRO[XXXX] / DEBU[XXXX]) to leave only the
-  # structured "Ran X checks / ✔ / ❌" output visible.
+  # uipathctl prefixes ALL lines with logrus tags (INFO[XXXX] / WARN[XXXX] etc.)
+  # and writes everything to stderr. Capture stderr+stdout together (2>&1),
+  # then:
+  #   1. Strip the logrus prefix (INFO[0009] ) from every line
+  #   2. Keep only structured health check lines — those containing
+  #      "Ran ", ✔, ❌, "successful", or "check" (filters out noisy lines like
+  #      "application X has sync enabled", "Pod X is healthy", etc.)
   local hc_output hc_exit=0
   hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
     2>&1) || hc_exit=$?
 
-  # Strip logrus noise; keep structured check output
   local clean_output
-  clean_output=$(echo "${hc_output}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[' || true)
+  clean_output=$(echo "${hc_output}" \
+    | sed 's/^[A-Z]*\[[0-9]*\] //' \
+    | grep -E 'Ran |✔|❌|successful|check' \
+    || true)
 
   if [[ "${hc_exit}" -ne 0 ]]; then
     check_warn "PF-07" \
