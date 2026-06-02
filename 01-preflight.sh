@@ -637,28 +637,28 @@ pf07_uipath_health() {
 
   info "PF-07: Using ${UIPATHCTL_BIN}"
 
-  # Capture stdout; suppress logrus INFO[xxxx] lines (stderr) unless verbose
+  # Capture stdout only; logrus INFO[XXXX] / WARN[XXXX] lines go to stderr — always suppressed.
+  # Some uipathctl builds also write INFO[XXXX] lines to stdout — strip those too via grep filter.
   local hc_output hc_exit=0
   hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
     2>/dev/null) || hc_exit=$?
 
+  # Structured output (Ran X checks / ✔ / ❌) — always show, both on pass and fail.
+  # Filter out any INFO[XXXX] / WARN[XXXX] logrus lines that leaked into stdout.
+  local clean_output
+  clean_output=$(echo "${hc_output}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[' || true)
+
   if [[ "${hc_exit}" -ne 0 ]]; then
     check_warn "PF-07" \
       "uipathctl health check reported failures (pre-existing app issue — does not block OS patching)"
-    # Show failing components; in verbose mode show the full tree
-    if [[ "${VERBOSE}" == "true" ]]; then
-      echo "${hc_output}" | sed 's/^/  /'
-    else
-      local failed_lines
-      failed_lines=$(echo "${hc_output}" | grep $'\xe2\x9d\x8c' || true)   # ❌ lines only
-      if [[ -n "${failed_lines}" ]]; then
-        echo "${failed_lines}" | sed 's/^/  /'
-      fi
-    fi
+    echo "${clean_output}" | sed 's/^/  /'
     return
   fi
 
   pass "PF-07: UiPath health check passed"
+  if [[ "${VERBOSE}" == "true" ]]; then
+    echo "${clean_output}" | sed 's/^/  /'
+  fi
 }
 
 # =============================================================================
