@@ -648,10 +648,11 @@ pf07_uipath_health() {
   hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
     2>&1) || hc_exit=$?
 
+  # Strip only pure logrus noise lines (INFO[0009] / WARN[0009] etc.)
+  # Everything else — Checks run / ✔ / ❌ / Error lines — passes through unchanged.
   local clean_output
   clean_output=$(echo "${hc_output}" \
-    | sed 's/^[A-Z]*\[[0-9]*\] //' \
-    | grep -E 'Ran |✔|❌|successful|check' \
+    | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' \
     || true)
 
   if [[ "${hc_exit}" -ne 0 ]]; then
