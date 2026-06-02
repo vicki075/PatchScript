@@ -637,14 +637,15 @@ pf07_uipath_health() {
 
   info "PF-07: Using ${UIPATHCTL_BIN}"
 
-  # Capture stdout only; logrus INFO[XXXX] / WARN[XXXX] lines go to stderr — always suppressed.
-  # Some uipathctl builds also write INFO[XXXX] lines to stdout — strip those too via grep filter.
+  # uipathctl writes ALL output (structured check results + logrus lines) to stderr.
+  # Capture stderr+stdout together (2>&1), then strip logrus-prefixed lines
+  # (INFO[XXXX] / WARN[XXXX] / ERRO[XXXX] / DEBU[XXXX]) to leave only the
+  # structured "Ran X checks / ✔ / ❌" output visible.
   local hc_output hc_exit=0
   hc_output=$("${UIPATHCTL_BIN}" health check --namespace "${UIPATH_NS}" --timeout 10m \
-    2>/dev/null) || hc_exit=$?
+    2>&1) || hc_exit=$?
 
-  # Structured output (Ran X checks / ✔ / ❌) — always show, both on pass and fail.
-  # Filter out any INFO[XXXX] / WARN[XXXX] logrus lines that leaked into stdout.
+  # Strip logrus noise; keep structured check output
   local clean_output
   clean_output=$(echo "${hc_output}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[' || true)
 
