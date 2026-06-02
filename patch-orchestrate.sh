@@ -46,10 +46,15 @@ export PATH="$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin"
 readonly UIPATH_NS="uipath"
 
 readonly ETCDCTL="/var/lib/rancher/rke2/bin/etcdctl"
+readonly CRICTL="/var/lib/rancher/rke2/bin/crictl"
+readonly CRI_CONFIG="/var/lib/rancher/rke2/agent/etc/crictl.yaml"
 readonly ETCD_CACERT="/var/lib/rancher/rke2/server/tls/etcd/server-ca.crt"
 readonly ETCD_CERT="/var/lib/rancher/rke2/server/tls/etcd/server-client.crt"
 readonly ETCD_KEY="/var/lib/rancher/rke2/server/tls/etcd/server-client.key"
 readonly ETCD_ENDPOINT="https://127.0.0.1:2379"
+
+ETCD_EXEC_MODE=""
+ETCD_CONTAINER_ID=""
 
 readonly STATE_LOG="/opt/UiPathAutomationSuite/prepatch-state.log"
 readonly BACKUP_BASE="/opt/UiPathAutomationSuite/backup_patch"
@@ -70,6 +75,9 @@ VERBOSE=false
 
 UIPATHCTL_BIN=""
 LEADER_NODE=""
+SERVER_NODES=()   # populated in main() after discover_nodes; used by init_etcd_access + build_node_name_map
+AGENT_NODES=()
+declare -A NODE_K8S_NAME   # SSH addr (IP) → Kubernetes node name
 
 # =============================================================================
 # HELPERS
@@ -287,6 +295,118 @@ maintenance_is_enabled() {
 }
 
 # =============================================================================
+# ETCD ACCESS — ported from 01-preflight.sh
+# Priority: local host binary → local crictl container exec → SSH into first server
+# =============================================================================
+init_etcd_access() {
+  # 1. Local host binary
+  if [[ -x "${ETCDCTL}" ]]; then
+    ETCD_EXEC_MODE="host"
+    info "etcd access: local host binary (${ETCDCTL})"
+    return 0
+  fi
+
+  # 2. Local crictl container exec
+  if [[ -x "${CRICTL}" ]]; then
+    local cid
+    cid=$(CRI_CONFIG_FILE="${CRI_CONFIG}" \
+      "${CRICTL}" ps --label io.kubernetes.container.name=etcd --quiet 2>/dev/null | head -1)
+    if [[ -n "${cid}" ]]; then
+      ETCD_EXEC_MODE="container"
+      ETCD_CONTAINER_ID="${cid}"
+      info "etcd access: crictl container exec (${cid:0:12})"
+      return 0
+    fi
+  fi
+
+  # 3. SSH into first server node and run etcdctl there
+  local first_server="${SERVER_NODES[0]:-}"
+  if [[ -n "${first_server}" ]]; then
+    info "etcd not accessible locally — will run via SSH on ${first_server}"
+    ETCD_EXEC_MODE="ssh:${first_server}"
+    return 0
+  fi
+
+  warn "etcdctl not accessible locally or via SSH — leader detection skipped"
+  return 1
+}
+
+etcdctl_cmd() {
+  local args=("$@")
+  case "${ETCD_EXEC_MODE}" in
+    host)
+      "${ETCDCTL}" \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "${args[@]}"
+      ;;
+    container)
+      CRI_CONFIG_FILE="${CRI_CONFIG}" \
+      "${CRICTL}" exec -i "${ETCD_CONTAINER_ID}" \
+        etcdctl \
+        --endpoints="${ETCD_ENDPOINT}" \
+        --cacert="${ETCD_CACERT}" \
+        --cert="${ETCD_CERT}" \
+        --key="${ETCD_KEY}" \
+        "${args[@]}"
+      ;;
+    ssh:*)
+      local ssh_node="${ETCD_EXEC_MODE#ssh:}"
+      # Build the etcdctl command as a remote string
+      local remote_args
+      remote_args=$(printf ' %q' "${args[@]}")
+      remote "${ssh_node}" "
+export PATH=\$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin
+/var/lib/rancher/rke2/bin/etcdctl \
+  --endpoints=${ETCD_ENDPOINT} \
+  --cacert=${ETCD_CACERT} \
+  --cert=${ETCD_CERT} \
+  --key=${ETCD_KEY} \
+  ${remote_args} 2>/dev/null
+" 2>/dev/null
+      ;;
+    *)
+      echo "etcdctl not available" >&2; return 1 ;;
+  esac
+}
+
+# =============================================================================
+# IP → KUBERNETES NODE NAME RESOLUTION
+# When --servers/--agents are given as IPs, kubectl needs the actual node name.
+# Build NODE_K8S_NAME map from: kubectl get nodes -o wide (NAME + INTERNAL-IP)
+# SSH uses the original addr (IP); kubectl uses k8s_name(addr).
+# =============================================================================
+build_node_name_map() {
+  info "Resolving SSH addresses to Kubernetes node names..."
+  local nodes_wide
+  nodes_wide=$(kubectl get nodes -o wide --no-headers 2>/dev/null | awk '{print $1, $6}') || return 0
+  # awk fields: $1=NAME  $6=INTERNAL-IP
+
+  for addr in "${SERVER_NODES[@]:-}" "${AGENT_NODES[@]:-}"; do
+    [[ -z "${addr}" ]] && continue
+    # Already a node name?
+    if echo "${nodes_wide}" | awk '{print $1}' | grep -qx "${addr}"; then
+      NODE_K8S_NAME["${addr}"]="${addr}"
+    else
+      local name
+      name=$(echo "${nodes_wide}" | awk -v ip="${addr}" '$2==ip {print $1}' | head -1)
+      if [[ -n "${name}" ]]; then
+        NODE_K8S_NAME["${addr}"]="${name}"
+        info "  ${addr} → ${name}"
+      else
+        NODE_K8S_NAME["${addr}"]="${addr}"
+        warn "  Could not resolve ${addr} to a k8s node name — kubectl ops may fail"
+      fi
+    fi
+  done
+}
+
+# k8s_name <ssh-addr> — Kubernetes node name for kubectl operations
+k8s_name() { echo "${NODE_K8S_NAME[${1}]:-${1}}"; }
+
+# =============================================================================
 # NODE DISCOVERY
 # =============================================================================
 discover_nodes() {
@@ -329,48 +449,33 @@ discover_nodes() {
 }
 
 # =============================================================================
-# ETCD LEADER DETECTION (local etcdctl)
+# ETCD LEADER DETECTION
+# Uses init_etcd_access() + etcdctl_cmd() — host binary → crictl → SSH fallback.
+# LEADER_NODE is set to the SSH address (IP) from SERVER_NODES that matches
+# the etcd leader IP, so that node comparison in main() works correctly.
 # =============================================================================
 detect_leader() {
-  if [[ ! -x "${ETCDCTL}" ]]; then
-    warn "etcdctl not found at ${ETCDCTL} — leader detection skipped"
-    LEADER_NODE=""
+  if ! init_etcd_access; then
+    warn "etcd not accessible — leader detection skipped (will stop servers in listed order)"
+    LEADER_NODE="${SERVER_NODES[${#SERVER_NODES[@]}-1]:-}"
+    [[ -n "${LEADER_NODE}" ]] && warn "  Defaulting leader to last server: ${LEADER_NODE}"
     return 0
   fi
 
   local cluster_status
-  cluster_status=$("${ETCDCTL}" \
-    --endpoints="${ETCD_ENDPOINT}" \
-    --cacert="${ETCD_CACERT}" \
-    --cert="${ETCD_CERT}" \
-    --key="${ETCD_KEY}" \
-    endpoint status --cluster -w json 2>/dev/null || true)
+  cluster_status=$(etcdctl_cmd endpoint status --cluster -w json 2>/dev/null || true)
 
   if [[ -z "${cluster_status}" ]]; then
     warn "etcdctl cluster endpoint status returned empty — leader unknown"
-    LEADER_NODE=""
+    LEADER_NODE="${SERVER_NODES[${#SERVER_NODES[@]}-1]:-}"
+    [[ -n "${LEADER_NODE}" ]] && warn "  Defaulting leader to last server: ${LEADER_NODE}"
     return 0
   fi
 
-  local node_ip_map
-  node_ip_map=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+  # Parse the leader's IP from the etcd JSON output
+  local leader_ip
+  leader_ip=$(echo "${cluster_status}" | python3 -c "
 import json, sys
-items = json.load(sys.stdin).get('items', [])
-for n in items:
-    name = n['metadata']['name']
-    for addr in n.get('status', {}).get('addresses', []):
-        if addr.get('type') == 'InternalIP':
-            print(addr['address'], name)
-            break
-" 2>/dev/null || true)
-
-  LEADER_NODE=$(echo "${cluster_status}" | python3 -c "
-import json, sys, os
-node_map = {}
-for line in os.environ.get('NODE_IP_MAP','').splitlines():
-    parts = line.split(None, 1)
-    if len(parts) == 2:
-        node_map[parts[0]] = parts[1]
 try:
     data = json.load(sys.stdin)
     if not isinstance(data, list):
@@ -385,13 +490,45 @@ try:
                 ip = ep.split('//')[1].split(':')[0]
             except Exception:
                 ip = ep
-            print(node_map.get(ip, ip))
+            print(ip)
             break
 except Exception:
     pass
-" NODE_IP_MAP="${node_ip_map}" 2>/dev/null || true)
+" 2>/dev/null || true)
 
-  info "etcd leader: ${LEADER_NODE:-unknown}"
+  if [[ -z "${leader_ip}" ]]; then
+    warn "Could not parse etcd leader IP — leader unknown"
+    LEADER_NODE="${SERVER_NODES[${#SERVER_NODES[@]}-1]:-}"
+    [[ -n "${LEADER_NODE}" ]] && warn "  Defaulting leader to last server: ${LEADER_NODE}"
+    return 0
+  fi
+
+  # Match leader_ip against SERVER_NODES list (which may be IPs for SSH)
+  LEADER_NODE=""
+  for node in "${SERVER_NODES[@]:-}"; do
+    if [[ "${node}" == "${leader_ip}" ]]; then
+      LEADER_NODE="${node}"
+      break
+    fi
+  done
+
+  # If SERVER_NODES contain hostnames, check the resolved IPs in NODE_K8S_NAME
+  if [[ -z "${LEADER_NODE}" ]]; then
+    for node in "${SERVER_NODES[@]:-}"; do
+      local kname="${NODE_K8S_NAME[${node}]:-}"
+      if [[ "${kname}" == "${leader_ip}" ]]; then
+        LEADER_NODE="${node}"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${LEADER_NODE}" ]]; then
+    warn "Leader IP ${leader_ip} not found in SERVER_NODES — defaulting to last server"
+    LEADER_NODE="${SERVER_NODES[${#SERVER_NODES[@]}-1]:-}"
+  fi
+
+  log "${GREEN}[INFO]${RESET}  etcd leader IP: ${leader_ip} → SSH addr: ${LEADER_NODE}"
 }
 
 # =============================================================================
@@ -401,8 +538,7 @@ run_health_check() {
   echo -e "\n${BOLD}--- Health Check ---${RESET}"
 
   local mm_raw
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
     pass "Health check: maintenance mode already enabled — skipping"
@@ -479,8 +615,7 @@ enable_maintenance_mode() {
   echo -e "\n${BOLD}--- Enable Maintenance Mode ---${RESET}"
 
   local mm_raw
-  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled \
-    --namespace "${UIPATH_NS}" 2>/dev/null || true)
+  mm_raw=$("${UIPATHCTL_BIN}" cluster maintenance is-enabled 2>/dev/null || true)
 
   if maintenance_is_enabled "${mm_raw}"; then
     pass "Maintenance mode already enabled — skipping"
@@ -488,9 +623,15 @@ enable_maintenance_mode() {
   fi
 
   info "Enabling maintenance mode..."
-  if ! "${UIPATHCTL_BIN}" cluster maintenance enable \
-       --namespace "${UIPATH_NS}" 2>/dev/null; then
-    abort "uipathctl cluster maintenance enable failed"
+  local enable_out enable_exit=0
+  enable_out=$("${UIPATHCTL_BIN}" cluster maintenance enable \
+    --timeout 20m 2>&1) || enable_exit=$?
+  local enable_clean
+  enable_clean=$(echo "${enable_out}" | grep -vE '^(INFO|WARN|ERRO|DEBU)\[[0-9]' || true)
+  if [[ "${enable_exit}" -ne 0 ]]; then
+    log "${RED}[FAIL]${RESET}  uipathctl cluster maintenance enable failed"
+    echo "${enable_clean}" | sed 's/^/    /'
+    abort "uipathctl cluster maintenance enable failed — see output above"
   fi
 
   # Wait up to 3 min for UiPath pods to scale to 0
@@ -529,11 +670,12 @@ cordon_all_nodes() {
   echo -e "\n${BOLD}--- Cordon All Nodes ---${RESET}"
 
   for node in "${all_nodes[@]}"; do
-    kubectl label node "${node}" nodejanitor/skip=true --overwrite 2>/dev/null \
-      || warn "  label nodejanitor/skip=true failed for ${node}"
-    kubectl cordon "${node}" 2>/dev/null \
-      || warn "  cordon failed for ${node}"
-    pass "  Cordoned: ${node}"
+    local kname; kname=$(k8s_name "${node}")
+    kubectl label node "${kname}" nodejanitor/skip=true --overwrite 2>/dev/null \
+      || warn "  label nodejanitor/skip=true failed for ${kname} (SSH: ${node})"
+    kubectl cordon "${kname}" 2>/dev/null \
+      || warn "  cordon failed for ${kname} (SSH: ${node})"
+    pass "  Cordoned: ${kname} (SSH: ${node})"
   done
 }
 
@@ -614,98 +756,120 @@ stop_agent_node() {
   local node="$1"
   echo -e "\n${BOLD}--- Stop Agent Node: ${node} ---${RESET}"
 
-  # Step 1 (UiPath docs): stop node-drain.service on the remote node
+  # Step 1 (UiPath docs): stop node-drain.service — ExecStop=/opt/node-drain.sh does
+  # the actual kubectl drain; timeout must cover full drain time, not just service startup
   log "  Running on ${node}: systemctl stop node-drain.service"
-  if remote "${node}" "timeout 60 systemctl stop node-drain.service 2>/dev/null"; then
-    pass "  node-drain.service stopped on ${node}"
+  remote "${node}" "
+if systemctl is-active --quiet node-drain.service 2>/dev/null \
+   || systemctl is-enabled --quiet node-drain.service 2>/dev/null; then
+  echo '  node-drain.service found — stopping (timeout: ${DRAIN_TIMEOUT_SECS}s)'
+  if timeout ${DRAIN_TIMEOUT_SECS} systemctl stop node-drain.service 2>&1; then
+    echo '[PASS]  node-drain.service stopped'
   else
-    warn "  node-drain.service not running or not found on ${node} — continuing"
+    echo \"[WARN]  systemctl stop node-drain.service exited \$? — continuing with kubectl drain\"
   fi
+else
+  echo '[WARN]  node-drain.service not found or disabled — will kubectl drain directly'
+fi
+" || warn "  node-drain remote check returned non-zero for ${node}"
 
-  # Step 1b: Kubernetes-level pod eviction (local kubectl)
-  log "  Running: kubectl drain ${node} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
-  if ! kubectl drain "${node}" \
+  # Step 1b: Kubernetes-level pod eviction (local kubectl — uses k8s node name)
+  local kname; kname=$(k8s_name "${node}")
+  log "  Running: kubectl drain ${kname} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
+  if ! kubectl drain "${kname}" \
        --ignore-daemonsets \
        --delete-emptydir-data \
        --timeout="${DRAIN_TIMEOUT_SECS}s" \
        --force 2>&1; then
-    warn "  kubectl drain returned non-zero for ${node} — continuing"
+    warn "  kubectl drain returned non-zero for ${kname} — continuing"
   fi
-  pass "  Drain complete: ${node}"
+  pass "  Drain complete: ${kname}"
 
   # Step 2 (UiPath docs): stop the Kubernetes process + Step 3: killall
   log "  Running on ${node}: systemctl stop rke2-agent + rke2-killall.sh"
   remote "${node}" "
 export PATH=\"\$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin\"
-echo '  Running: systemctl stop rke2-agent  (timeout: ${STOP_TIMEOUT_SECS}s)'
+MYHOST=\$(hostname -s)
+echo \"  Running: systemctl stop rke2-agent  (timeout: ${STOP_TIMEOUT_SECS}s)\"
 if timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-agent 2>&1; then
   echo '[PASS]  rke2-agent stopped'
 else
   echo '[WARN]  rke2-agent stop returned non-zero — continuing to killall'
 fi
-echo '  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)'
+echo \"  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)\"
 timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo '[WARN]  rke2-killall.sh returned non-zero'
 echo '[PASS]  rke2-killall.sh complete'
 residual=\$(ps aux 2>/dev/null | grep -E 'containerd|kubelet|rke2' | grep -v grep | grep -v patch-orchestrate || true)
 if [[ -n \"\${residual}\" ]]; then
-  echo '[WARN]  Residual processes remain on \$(hostname):'
+  echo \"[WARN]  Residual processes remain on \${MYHOST}:\"
   echo \"\${residual}\" | sed 's/^/    /'
 else
-  echo '[PASS]  No residual rke2/containerd/kubelet processes on \$(hostname)'
+  echo \"[PASS]  No residual rke2/containerd/kubelet processes on \${MYHOST}\"
 fi
 " || warn "  SSH stop command returned non-zero for ${node}"
 
-  state_log "AGENT_STOPPED  ${node}  (orchestrated)"
-  pass "  Agent node ${node}: stopped"
+  state_log "AGENT_STOPPED  ${node}  k8s=${kname}  (orchestrated)"
+  pass "  Agent node ${node} (${kname}): stopped"
 }
 
 stop_server_node() {
   local node="$1"
   echo -e "\n${BOLD}--- Stop Server Node: ${node} ---${RESET}"
 
-  # Step 1 (UiPath docs): stop node-drain.service on the remote node
+  # Step 1 (UiPath docs): stop node-drain.service — ExecStop=/opt/node-drain.sh does
+  # the actual kubectl drain; timeout must cover full drain time, not just service startup
   log "  Running on ${node}: systemctl stop node-drain.service"
-  if remote "${node}" "timeout 60 systemctl stop node-drain.service 2>/dev/null"; then
-    pass "  node-drain.service stopped on ${node}"
+  remote "${node}" "
+if systemctl is-active --quiet node-drain.service 2>/dev/null \
+   || systemctl is-enabled --quiet node-drain.service 2>/dev/null; then
+  echo '  node-drain.service found — stopping (timeout: ${DRAIN_TIMEOUT_SECS}s)'
+  if timeout ${DRAIN_TIMEOUT_SECS} systemctl stop node-drain.service 2>&1; then
+    echo '[PASS]  node-drain.service stopped'
   else
-    warn "  node-drain.service not running or not found on ${node} — continuing"
+    echo \"[WARN]  systemctl stop node-drain.service exited \$? — continuing with kubectl drain\"
   fi
+else
+  echo '[WARN]  node-drain.service not found or disabled — will kubectl drain directly'
+fi
+" || warn "  node-drain remote check returned non-zero for ${node}"
 
-  # Step 1b: Kubernetes-level pod eviction (local kubectl)
-  log "  Running: kubectl drain ${node} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
-  if ! kubectl drain "${node}" \
+  # Step 1b: Kubernetes-level pod eviction (local kubectl — uses k8s node name)
+  local kname; kname=$(k8s_name "${node}")
+  log "  Running: kubectl drain ${kname} --ignore-daemonsets --delete-emptydir-data --timeout=${DRAIN_TIMEOUT_SECS}s --force"
+  if ! kubectl drain "${kname}" \
        --ignore-daemonsets \
        --delete-emptydir-data \
        --timeout="${DRAIN_TIMEOUT_SECS}s" \
        --force 2>&1; then
-    warn "  kubectl drain returned non-zero for ${node} — continuing"
+    warn "  kubectl drain returned non-zero for ${kname} — continuing"
   fi
-  pass "  Drain complete: ${node}"
+  pass "  Drain complete: ${kname}"
 
   # Step 2 (UiPath docs): stop the Kubernetes process + Step 3: killall
   log "  Running on ${node}: systemctl stop rke2-server + rke2-killall.sh"
   remote "${node}" "
 export PATH=\"\$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin\"
-echo '  Running: systemctl stop rke2-server  (timeout: ${STOP_TIMEOUT_SECS}s)'
+MYHOST=\$(hostname -s)
+echo \"  Running: systemctl stop rke2-server  (timeout: ${STOP_TIMEOUT_SECS}s)\"
 if timeout ${STOP_TIMEOUT_SECS} systemctl stop rke2-server 2>&1; then
   echo '[PASS]  rke2-server stopped'
 else
   echo '[WARN]  rke2-server stop returned non-zero — continuing to killall'
 fi
-echo '  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)'
+echo \"  Running: rke2-killall.sh  (timeout: ${KILLALL_TIMEOUT_SECS}s)\"
 timeout ${KILLALL_TIMEOUT_SECS} rke2-killall.sh 2>&1 || echo '[WARN]  rke2-killall.sh returned non-zero'
 echo '[PASS]  rke2-killall.sh complete'
 residual=\$(ps aux 2>/dev/null | grep -E 'containerd|kubelet|rke2' | grep -v grep | grep -v patch-orchestrate || true)
 if [[ -n \"\${residual}\" ]]; then
-  echo '[WARN]  Residual processes remain on \$(hostname):'
+  echo \"[WARN]  Residual processes remain on \${MYHOST}:\"
   echo \"\${residual}\" | sed 's/^/    /'
 else
-  echo '[PASS]  No residual rke2/containerd/kubelet processes on \$(hostname)'
+  echo \"[PASS]  No residual rke2/containerd/kubelet processes on \${MYHOST}\"
 fi
 " || warn "  SSH stop command returned non-zero for ${node}"
 
-  state_log "SERVER_STOPPED  ${node}  (orchestrated)"
-  pass "  Server node ${node}: stopped"
+  state_log "SERVER_STOPPED  ${node}  k8s=${kname}  (orchestrated)"
+  pass "  Server node ${node} (${kname}): stopped"
 }
 
 # =============================================================================
@@ -758,21 +922,25 @@ main() {
   # Step 3: Discover nodes
   discover_nodes
 
-  local server_nodes=()
-  local agent_nodes=()
+  # Populate global SERVER_NODES / AGENT_NODES (used by init_etcd_access, build_node_name_map, detect_leader)
+  SERVER_NODES=()
+  AGENT_NODES=()
   while IFS= read -r n; do
-    [[ -n "${n}" ]] && server_nodes+=("${n}")
+    [[ -n "${n}" ]] && SERVER_NODES+=("${n}")
   done < /tmp/patch-orchestrate-servers.$$
   while IFS= read -r n; do
-    [[ -n "${n}" ]] && agent_nodes+=("${n}")
+    [[ -n "${n}" ]] && AGENT_NODES+=("${n}")
   done < /tmp/patch-orchestrate-agents.$$
   rm -f /tmp/patch-orchestrate-servers.$$ /tmp/patch-orchestrate-agents.$$
 
-  # Step 4: Detect etcd leader + split server nodes
+  # Step 4a: Build IP → k8s node name map (SSH addrs may be IPs; kubectl needs node names)
+  build_node_name_map
+
+  # Step 4b: Detect etcd leader + split server nodes
   detect_leader
 
   local non_leaders=()
-  for node in "${server_nodes[@]}"; do
+  for node in "${SERVER_NODES[@]}"; do
     if [[ "${node}" != "${LEADER_NODE}" ]]; then
       non_leaders+=("${node}")
     fi
@@ -780,17 +948,17 @@ main() {
 
   # Step 5: Print topology
   echo -e "${BOLD}--- Cluster Topology ---${RESET}"
-  echo "  Server nodes:   ${server_nodes[*]:-none}"
-  echo "  etcd leader:    ${LEADER_NODE:-unknown} (stop last, reboot first)"
-  echo "  Non-leaders:    ${non_leaders[*]:-none}"
-  echo "  Agent nodes:    ${agent_nodes[*]:-none}"
+  echo "  Server nodes (SSH): ${SERVER_NODES[*]:-none}"
+  echo "  etcd leader:        ${LEADER_NODE:-unknown} (stop last, reboot first)"
+  echo "  Non-leaders:        ${non_leaders[*]:-none}"
+  echo "  Agent nodes (SSH):  ${AGENT_NODES[*]:-none}"
   echo ""
   echo "  Stop order:     agents → non-leader servers → ${LEADER_NODE:-leader} (last)"
   echo "  Reboot order:   ${LEADER_NODE:-leader} (first) → other servers → agents"
   echo ""
 
   # Step 6: Test SSH connectivity to all nodes
-  local all_nodes=("${server_nodes[@]}" "${agent_nodes[@]}")
+  local all_nodes=("${SERVER_NODES[@]}" "${AGENT_NODES[@]}")
   if [[ ${#all_nodes[@]} -gt 0 ]]; then
     test_ssh_connectivity "${all_nodes[@]}"
   fi
@@ -805,14 +973,14 @@ main() {
   cordon_all_nodes "${all_nodes[@]}"
 
   # Step 10: Backup all server nodes in parallel
-  if [[ ${#server_nodes[@]} -gt 0 ]]; then
-    backup_server_nodes "${server_nodes[@]}"
+  if [[ ${#SERVER_NODES[@]} -gt 0 ]]; then
+    backup_server_nodes "${SERVER_NODES[@]}"
   fi
 
   # Step 11: Stop agent nodes (sequential)
-  if [[ ${#agent_nodes[@]} -gt 0 ]]; then
+  if [[ ${#AGENT_NODES[@]} -gt 0 ]]; then
     echo -e "\n${BOLD}--- Stopping Agent Nodes (sequential) ---${RESET}"
-    for node in "${agent_nodes[@]}"; do
+    for node in "${AGENT_NODES[@]}"; do
       stop_agent_node "${node}"
     done
   fi

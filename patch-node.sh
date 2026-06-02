@@ -562,12 +562,19 @@ phase_leader_info() {
 phase_drain() {
   echo -e "\n${BOLD}--- Phase 5: Drain ---${RESET}"
 
-  # Step 1 (UiPath docs): stop node-drain.service to drain workloads off this node
-  log "  Running: systemctl stop node-drain.service"
-  if timeout 60 systemctl stop node-drain.service 2>/dev/null; then
-    pass "Phase 5: node-drain.service stopped"
+  # Step 1 (UiPath docs): stop node-drain.service — ExecStop runs /opt/node-drain.sh
+  # which performs kubectl drain internally; timeout must cover full drain time
+  if systemctl is-active --quiet node-drain.service 2>/dev/null \
+     || systemctl is-enabled --quiet node-drain.service 2>/dev/null; then
+    log "  Running: systemctl stop node-drain.service  (timeout: ${DRAIN_TIMEOUT_SECS}s)"
+    if timeout "${DRAIN_TIMEOUT_SECS}" systemctl stop node-drain.service 2>&1; then
+      pass "Phase 5: node-drain.service stopped"
+    else
+      local rc=$?
+      warn "Phase 5: systemctl stop node-drain.service exited ${rc} — continuing with kubectl drain"
+    fi
   else
-    warn "Phase 5: node-drain.service not running or not found — continuing"
+    warn "Phase 5: node-drain.service not found or disabled — skipping (will kubectl drain directly)"
   fi
 
   # Step 1b: Kubernetes-level pod eviction for any remaining pods
