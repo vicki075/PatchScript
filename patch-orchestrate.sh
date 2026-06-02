@@ -60,6 +60,7 @@ readonly KILLALL_TIMEOUT_SECS=120
 
 SSH_USER="root"
 SSH_PASSWORD=""
+USE_SUDO=false    # auto-set to true when SSH_USER != "root"
 SSH_PORT=22
 INSTALLER_DIR=""
 SKIP_HC_COMPONENTS=()
@@ -108,6 +109,8 @@ usage() {
   echo "Options:"
   echo "  --installer-dir=<path>   UiPath version folder; required unless uipathctl is in PATH"
   echo "  --ssh-user=<user>        SSH user (default: root)"
+  echo "                           If non-root (e.g. admin), sudo is used automatically."
+  echo "                           The same password is used for SSH and sudo."
   echo "  --ssh-port=<port>        SSH port (default: 22)"
   echo "  --skip-hc=all           Skip health check failures entirely"
   echo "  --skip-hc=comp1,comp2   Skip specific failing components by name"
@@ -119,7 +122,14 @@ usage() {
 
 # =============================================================================
 # SSH WRAPPER
-# Requires sshpass installed. Uses SSHPASS env var for password.
+# Requires sshpass installed. Uses SSHPASS env var for SSH password auth.
+#
+# Sudo mode (auto-enabled when SSH_USER != "root"):
+#   sshpass handles SSH authentication via the SSHPASS env var.
+#   After SSH auth, the same password is piped as the first stdin line for
+#   sudo -S, followed by the script body.  sudo reads one line (password),
+#   then bash -s reads the rest (the actual commands).
+#   Command: printf '%s\n%s\n' PASSWORD SCRIPT | ssh ... "sudo -S -p '' bash -s"
 # =============================================================================
 check_sshpass() {
   if ! command -v sshpass &>/dev/null; then
@@ -127,55 +137,108 @@ check_sshpass() {
   fi
 }
 
+# _ssh_base <node> — emit common SSH options (used by remote and remote_bg)
+_ssh_opts() {
+  echo -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p "${SSH_PORT}"
+}
+
 # remote <node> <cmd> — blocking SSH, output tee'd to STATE_LOG
 remote() {
   local node="$1"
   local cmd="$2"
-  SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -p "${SSH_PORT}" \
-    "${SSH_USER}@${node}" \
-    "${cmd}" 2>&1 | tee -a "${STATE_LOG}"
-  return "${PIPESTATUS[0]}"
+  local exit_idx   # which PIPESTATUS slot holds the ssh/sudo exit code
+
+  if [[ "${USE_SUDO}" == "true" ]]; then
+    # Feed: line 1 = sudo password, remaining lines = script
+    printf '%s\n%s\n' "${SSH_PASSWORD}" "${cmd}" \
+      | SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=15 \
+          -p "${SSH_PORT}" \
+          "${SSH_USER}@${node}" \
+          "sudo -S -p '' bash -s" 2>&1 \
+      | tee -a "${STATE_LOG}"
+    # PIPESTATUS: [0]=printf [1]=sshpass/ssh [2]=tee
+    return "${PIPESTATUS[1]}"
+  else
+    SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -p "${SSH_PORT}" \
+      "${SSH_USER}@${node}" \
+      "${cmd}" 2>&1 | tee -a "${STATE_LOG}"
+    return "${PIPESTATUS[0]}"
+  fi
 }
 
-# remote_bg <node> <cmd> — non-blocking SSH (for parallel jobs)
+# remote_bg <node> <cmd> — non-blocking SSH (for parallel backup jobs)
 remote_bg() {
   local node="$1"
   local cmd="$2"
-  SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -p "${SSH_PORT}" \
-    "${SSH_USER}@${node}" \
-    "${cmd}" 2>&1 | tee -a "${STATE_LOG}"
+
+  if [[ "${USE_SUDO}" == "true" ]]; then
+    printf '%s\n%s\n' "${SSH_PASSWORD}" "${cmd}" \
+      | SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=15 \
+          -p "${SSH_PORT}" \
+          "${SSH_USER}@${node}" \
+          "sudo -S -p '' bash -s" 2>&1 \
+      | tee -a "${STATE_LOG}"
+  else
+    SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -p "${SSH_PORT}" \
+      "${SSH_USER}@${node}" \
+      "${cmd}" 2>&1 | tee -a "${STATE_LOG}"
+  fi
 }
 
 # =============================================================================
-# SSH CONNECTIVITY TEST
+# SSH CONNECTIVITY TEST — verifies SSH + sudo (if non-root user)
 # =============================================================================
 test_ssh_connectivity() {
   local nodes=("$@")
   local failed=()
 
-  log "Testing SSH connectivity to ${#nodes[@]} node(s)..."
+  log "Testing SSH connectivity to ${#nodes[@]} node(s) (user: ${SSH_USER}, sudo: ${USE_SUDO})..."
   for node in "${nodes[@]}"; do
-    if SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
-       -o StrictHostKeyChecking=no \
-       -o ConnectTimeout=15 \
-       -p "${SSH_PORT}" \
-       "${SSH_USER}@${node}" \
-       "echo ssh-ok" &>/dev/null; then
-      pass "  SSH OK: ${node}"
-    else
+    # Basic SSH test
+    if ! SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+         -o StrictHostKeyChecking=no \
+         -o ConnectTimeout=15 \
+         -p "${SSH_PORT}" \
+         "${SSH_USER}@${node}" \
+         "echo ssh-ok" &>/dev/null; then
       warn "  SSH FAIL: ${node}"
       failed+=("${node}")
+      continue
+    fi
+
+    # Sudo test (non-root users)
+    if [[ "${USE_SUDO}" == "true" ]]; then
+      local sudo_out
+      sudo_out=$(printf '%s\nid\n' "${SSH_PASSWORD}" \
+        | SSHPASS="${SSH_PASSWORD}" sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            -p "${SSH_PORT}" \
+            "${SSH_USER}@${node}" \
+            "sudo -S -p '' bash -s" 2>/dev/null)
+      if echo "${sudo_out}" | grep -q "uid=0"; then
+        pass "  SSH + sudo OK: ${node}"
+      else
+        warn "  SSH OK but sudo to root FAILED on ${node} — check sudoers"
+        failed+=("${node}")
+      fi
+    else
+      pass "  SSH OK: ${node}"
     fi
   done
 
   if [[ ${#failed[@]} -gt 0 ]]; then
-    abort "SSH connectivity test failed for: ${failed[*]}"
+    abort "SSH/sudo connectivity test failed for: ${failed[*]}"
   fi
 }
 
@@ -669,6 +732,12 @@ main() {
 
   if [[ -z "${SSH_PASSWORD}" ]]; then
     abort "--ssh-password is required"
+  fi
+
+  # Auto-enable sudo when SSH user is not root
+  if [[ "${SSH_USER}" != "root" ]]; then
+    USE_SUDO=true
+    log "${CYAN}[INFO]${RESET}  Non-root SSH user '${SSH_USER}' — sudo mode enabled (same password used for sudo)"
   fi
 
   echo -e "\n${BOLD}================================================================${RESET}"
